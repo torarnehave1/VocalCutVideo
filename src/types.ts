@@ -13,11 +13,18 @@ export interface Voiceover {
   text?: string;
 }
 
-export interface VideoState {
-  url: string | null;
+export interface VideoClip {
+  id: string;
+  url: string;
   duration: number;
   trimStart: number;
   trimEnd: number;
+}
+
+export interface VideoState {
+  clips: VideoClip[];
   subtitles: Subtitle[];
   voiceovers: Voiceover[];
+  watermarkUrl?: string;
+  watermarkSize?: number; // percentage of width (0-100)
 }

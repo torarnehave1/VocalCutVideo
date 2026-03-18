@@ -2,11 +2,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import { 
   Play, Pause, Scissors, Mic, Type, Download, 
   Trash2, Plus, Volume2, Wand2, Upload, ChevronRight, 
-  ChevronLeft, X, Save
+  ChevronLeft, X, Save, Image as ImageIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { generateAIVoice } from './services/gemini';
-import { Subtitle, Voiceover, VideoState } from './types';
+import { Subtitle, Voiceover, VideoState, VideoClip } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -16,17 +16,43 @@ function cn(...inputs: ClassValue[]) {
 
 export default function App() {
   const [videoState, setVideoState] = useState<VideoState>({
-    url: null,
-    duration: 0,
-    trimStart: 0,
-    trimEnd: 0,
+    clips: [],
     subtitles: [],
     voiceovers: [],
+    watermarkSize: 15,
   });
+
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const selectedClip = videoState.clips.find(c => c.id === selectedClipId);
 
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [activeTab, setActiveTab] = useState<'trim' | 'voice' | 'subtitles'>('trim');
+  
+  const totalDuration = videoState.clips.reduce((acc, clip) => acc + (clip.trimEnd - clip.trimStart), 0);
+
+  const getGlobalTime = (clipId: string, localTime: number) => {
+    let globalTime = 0;
+    for (const clip of videoState.clips) {
+      if (clip.id === clipId) {
+        return globalTime + (localTime - clip.trimStart);
+      }
+      globalTime += (clip.trimEnd - clip.trimStart);
+    }
+    return globalTime;
+  };
+
+  const getClipAtTime = (globalTime: number) => {
+    let accumulatedTime = 0;
+    for (const clip of videoState.clips) {
+      const clipDuration = clip.trimEnd - clip.trimStart;
+      if (globalTime <= accumulatedTime + clipDuration) {
+        return { clip, localTime: clip.trimStart + (globalTime - accumulatedTime) };
+      }
+      accumulatedTime += clipDuration;
+    }
+    return null;
+  };
+  const [activeTab, setActiveTab] = useState<'trim' | 'voice' | 'subtitles' | 'watermark'>('trim');
   const [showSubtitles, setShowSubtitles] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
   const [aiText, setAiText] = useState('');
@@ -34,34 +60,48 @@ export default function App() {
   const [isGeneratingAi, setIsGeneratingAi] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [draggingHandle, setDraggingHandle] = useState<{ clipId: string, type: 'start' | 'end' } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
   // Handle Video Upload
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const url = URL.createObjectURL(file);
+    const files = e.target.files;
+    if (files) {
+      const newClips: VideoClip[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const url = URL.createObjectURL(file);
+        const id = Math.random().toString(36).substr(2, 9);
+        newClips.push({
+          id,
+          url,
+          duration: 0,
+          trimStart: 0,
+          trimEnd: 0,
+        });
+      }
+      
       setVideoState(prev => ({
         ...prev,
-        url,
-        trimStart: 0,
-        trimEnd: 0, // Will be set once metadata loaded
-        subtitles: [],
-        voiceovers: [],
+        clips: [...prev.clips, ...newClips],
       }));
+
+      if (!selectedClipId && newClips.length > 0) {
+        setSelectedClipId(newClips[0].id);
+      }
     }
   };
 
-  const onLoadedMetadata = () => {
+  const onLoadedMetadata = (id: string) => {
     if (videoRef.current) {
       const duration = videoRef.current.duration;
       setVideoState(prev => ({
         ...prev,
-        duration,
-        trimEnd: duration,
+        clips: prev.clips.map(c => c.id === id ? { ...c, duration, trimEnd: duration } : c),
       }));
     }
   };
@@ -78,17 +118,40 @@ export default function App() {
   };
 
   const handleTimeUpdate = () => {
-    if (videoRef.current) {
-      const time = videoRef.current.currentTime;
-      setCurrentTime(time);
+    if (videoRef.current && selectedClip) {
+      const localTime = videoRef.current.currentTime;
+      const globalTime = getGlobalTime(selectedClip.id, localTime);
+      setCurrentTime(globalTime);
       
-      // Handle trim loop/stop
-      if (time >= videoState.trimEnd) {
-        videoRef.current.currentTime = videoState.trimStart;
-        if (!isPlaying) videoRef.current.pause();
+      // Handle clip transition or loop
+      if (localTime >= selectedClip.trimEnd) {
+        const nextClipInfo = getClipAtTime(globalTime + 0.01);
+        if (nextClipInfo && nextClipInfo.clip.id !== selectedClip.id) {
+          setSelectedClipId(nextClipInfo.clip.id);
+          // The useEffect for selectedClipId will handle setting currentTime on the video
+        } else {
+          // Loop or stop
+          videoRef.current.currentTime = selectedClip.trimStart;
+          if (!isPlaying) videoRef.current.pause();
+        }
       }
     }
   };
+
+  useEffect(() => {
+    if (videoRef.current && selectedClip) {
+      // When selected clip changes, we might need to seek to its trim start
+      // but only if we are not already at the right global time
+      const clipInfo = getClipAtTime(currentTime);
+      if (clipInfo && clipInfo.clip.id === selectedClip.id) {
+        if (Math.abs(videoRef.current.currentTime - clipInfo.localTime) > 0.1) {
+          videoRef.current.currentTime = clipInfo.localTime;
+        }
+      } else {
+        videoRef.current.currentTime = selectedClip.trimStart;
+      }
+    }
+  }, [selectedClipId]);
 
   // Voiceover: Recording
   const startRecording = async () => {
@@ -142,6 +205,58 @@ export default function App() {
     }
   };
 
+  // Timeline Dragging Logic
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!draggingHandle || !timelineRef.current) return;
+
+      const rect = timelineRef.current.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const percentage = x / rect.width;
+      const targetGlobalTime = percentage * totalDuration;
+
+      setVideoState(prev => {
+        const clipIndex = prev.clips.findIndex(c => c.id === draggingHandle.clipId);
+        if (clipIndex === -1) return prev;
+
+        const clip = prev.clips[clipIndex];
+        let accumulatedBefore = 0;
+        for (let i = 0; i < clipIndex; i++) {
+          accumulatedBefore += (prev.clips[i].trimEnd - prev.clips[i].trimStart);
+        }
+
+        const localTime = (targetGlobalTime - accumulatedBefore) + clip.trimStart;
+        const newClips = [...prev.clips];
+
+        if (draggingHandle.type === 'start') {
+          const newTrimStart = Math.max(0, Math.min(localTime, clip.trimEnd - 0.1));
+          newClips[clipIndex] = { ...clip, trimStart: newTrimStart };
+          if (videoRef.current) videoRef.current.currentTime = newTrimStart;
+        } else {
+          const newTrimEnd = Math.max(clip.trimStart + 0.1, Math.min(localTime, clip.duration));
+          newClips[clipIndex] = { ...clip, trimEnd: newTrimEnd };
+          if (videoRef.current) videoRef.current.currentTime = newTrimEnd;
+        }
+
+        return { ...prev, clips: newClips };
+      });
+    };
+
+    const handleMouseUp = () => {
+      setDraggingHandle(null);
+    };
+
+    if (draggingHandle) {
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+    }
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [draggingHandle, totalDuration]);
+
   // Voiceover: Upload
   const handleAudioUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -166,124 +281,284 @@ export default function App() {
     }
   };
 
-  const handleExport = async () => {
-    if (!videoRef.current || !videoState.url) return;
+  // Watermark: Upload
+  const handleWatermarkUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = URL.createObjectURL(file);
+      setVideoState(prev => ({ ...prev, watermarkUrl: url }));
+    }
+  };
 
+  const handleExport = async () => {
+    if (!videoRef.current || videoState.clips.length === 0) return;
+
+    console.log("Starting export process...");
     setIsExporting(true);
     setExportProgress(0);
     setIsPlaying(false);
-    videoRef.current.pause();
+    
+    const video = videoRef.current;
+    video.pause();
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const video = videoRef.current;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    // Cap resolution for performance (1080x2336 is very high for real-time capture)
+    const MAX_DIM = 1280;
+    let w = video.videoWidth || 1280;
+    let h = video.videoHeight || 720;
+    if (w > MAX_DIM || h > MAX_DIM) {
+      const ratio = w / h;
+      if (w > h) {
+        w = MAX_DIM;
+        h = Math.round(MAX_DIM / ratio);
+      } else {
+        h = MAX_DIM;
+        w = Math.round(MAX_DIM * ratio);
+      }
+    }
+    canvas.width = w;
+    canvas.height = h;
+    console.log(`Canvas initialized (capped): ${canvas.width}x${canvas.height}`);
 
     const stream = canvas.captureStream(30);
-    const audioCtx = new AudioContext({ sampleRate: 48000 });
-    const dest = audioCtx.createMediaStreamDestination();
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
     
-    // Master Gain to prevent clipping
+    // Ensure AudioContext is running
+    if (audioCtx.state === 'suspended') {
+      await audioCtx.resume();
+      // Small delay for audio hardware to warm up
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    const dest = audioCtx.createMediaStreamDestination();
     const masterGain = audioCtx.createGain();
-    masterGain.gain.value = 0.9; // Slightly lower than 1 to provide headroom
+    masterGain.gain.value = 1.0;
     masterGain.connect(dest);
     masterGain.connect(audioCtx.destination);
 
-    // Video Audio
-    const videoSource = audioCtx.createMediaElementSource(video);
-    videoSource.connect(masterGain);
+    // Video Audio - Handle potential re-initialization
+    let videoSource;
+    try {
+      videoSource = audioCtx.createMediaElementSource(video);
+      videoSource.connect(masterGain);
+    } catch (e) {
+      console.warn("MediaElementSource already exists or failed to connect:", e);
+    }
 
-    // Voiceovers
     const voiceoverAudios: HTMLAudioElement[] = [];
+    const triggeredVoiceovers = new Set<string>();
     
+    // Load watermark image if exists
+    let watermarkImg: HTMLImageElement | null = null;
+    if (videoState.watermarkUrl) {
+      watermarkImg = new Image();
+      watermarkImg.src = videoState.watermarkUrl;
+      await new Promise((resolve) => {
+        if (watermarkImg) {
+          watermarkImg.onload = resolve;
+          watermarkImg.onerror = resolve; // Continue even if watermark fails
+        } else {
+          resolve(null);
+        }
+      });
+    }
+    
+    // Try to find a supported mime type
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') 
+      ? 'video/webm;codecs=vp9,opus' 
+      : 'video/webm';
+    
+    console.log(`Using mimeType: ${mimeType}`);
+
     const recorder = new MediaRecorder(new MediaStream([
       ...stream.getVideoTracks(),
       ...dest.stream.getAudioTracks()
     ]), { 
-      mimeType: 'video/webm;codecs=vp9,opus',
+      mimeType,
       videoBitsPerSecond: 5000000,
-      audioBitsPerSecond: 128000
     });
 
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => chunks.push(e.data);
     recorder.onstop = () => {
+      console.log("Recorder stopped, generating blob...");
       const blob = new Blob(chunks, { type: 'video/webm' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'vocalcut-export.webm';
+      a.download = `vocalcut-export-${Date.now()}.webm`;
       a.click();
       setIsExporting(false);
-      
-      // Cleanup
       audioCtx.close();
-      voiceoverAudios.forEach(a => a.pause());
+      voiceoverAudios.forEach(a => {
+        a.pause();
+        a.src = "";
+      });
     };
 
-    video.currentTime = videoState.trimStart;
-    recorder.start();
+    let currentClipIndex = 0;
+    let isTransitioning = false;
+    let lastLogTime = 0;
 
-    const renderFrame = () => {
-      // Draw Video
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      // Draw Subtitles
-      const time = video.currentTime;
-      const activeSubs = showSubtitles ? videoState.subtitles.filter(s => time >= s.start && time <= s.end) : [];
-      
-      if (activeSubs.length > 0) {
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
-        ctx.font = `${canvas.height * 0.05}px Inter, sans-serif`;
-        ctx.textAlign = 'center';
-        
-        activeSubs.forEach((sub, i) => {
-          const text = sub.text;
-          const metrics = ctx.measureText(text);
-          const padding = 20;
-          const rectWidth = metrics.width + padding * 2;
-          const rectHeight = canvas.height * 0.07;
-          
-          ctx.fillRect(
-            canvas.width / 2 - rectWidth / 2,
-            canvas.height * 0.85 - rectHeight / 2 + (i * rectHeight * 1.2),
-            rectWidth,
-            rectHeight
-          );
-          
-          ctx.fillStyle = 'white';
-          ctx.fillText(text, canvas.width / 2, canvas.height * 0.85 + (i * rectHeight * 1.2) + 10);
-        });
+    const processClip = async (index: number) => {
+      const clip = videoState.clips[index];
+      if (!clip) {
+        console.log("No more clips, stopping recorder.");
+        recorder.stop();
+        return;
       }
 
-      // Trigger Voiceovers
-      videoState.voiceovers.forEach(v => {
-        if (Math.abs(time - v.startTime) < 0.05) {
-          const audio = new Audio(v.url);
-          const source = audioCtx.createMediaElementSource(audio);
-          source.connect(masterGain);
-          audio.play();
-          voiceoverAudios.push(audio);
-        }
+      console.log(`Loading Clip ${index + 1}: ${clip.id}`);
+      isTransitioning = true;
+      video.src = clip.url;
+      video.muted = false; // Ensure audio is captured
+      video.playbackRate = 1.0;
+      
+      await new Promise((resolve) => {
+        const onCanPlay = () => {
+          video.removeEventListener('canplay', onCanPlay);
+          video.currentTime = clip.trimStart;
+          console.log(`Clip ${index + 1} ready at ${clip.trimStart}s`);
+          resolve(null);
+        };
+        video.addEventListener('canplay', onCanPlay);
+        
+        // Safety timeout
+        setTimeout(() => {
+          video.removeEventListener('canplay', onCanPlay);
+          resolve(null);
+        }, 5000);
       });
 
-      const progress = ((time - videoState.trimStart) / (videoState.trimEnd - videoState.trimStart)) * 100;
-      setExportProgress(Math.min(100, progress));
+      isTransitioning = false;
+      try {
+        await video.play();
+      } catch (e) {
+        console.error("Video play failed during export:", e);
+        // Try one more time after a tiny delay
+        setTimeout(() => video.play(), 100);
+      }
+    };
 
-      if (time >= videoState.trimEnd) {
-        recorder.stop();
-        video.pause();
+    recorder.start();
+    console.log("Recorder started.");
+    await processClip(0);
+
+    // Use a local variable to avoid closure issues with React state
+    let activeExport = true;
+
+    const renderFrame = () => {
+      if (!activeExport) return;
+
+      if (!isTransitioning) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const localTime = video.currentTime;
+        const clip = videoState.clips[currentClipIndex];
+        const globalTime = getGlobalTime(clip.id, localTime);
+
+        // Heartbeat log
+        const now = Date.now();
+        if (now - lastLogTime > 1000) {
+          console.log(`Export Heartbeat: Global ${globalTime.toFixed(2)}s, Local ${localTime.toFixed(2)}s, Progress ${Math.round((globalTime / (totalDuration || 1)) * 100)}%, VideoPaused: ${video.paused}`);
+          lastLogTime = now;
+          
+          // Kickstart if stuck
+          if (video.paused && !isTransitioning) {
+            console.log("Kickstarting stalled video...");
+            video.play().catch(() => {});
+          }
+        }
+
+        // Subtitles
+        const activeSubs = showSubtitles ? videoState.subtitles.filter(s => globalTime >= s.start && globalTime <= s.end) : [];
+        if (activeSubs.length > 0) {
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+          ctx.font = `${canvas.height * 0.05}px Inter, sans-serif`;
+          ctx.textAlign = 'center';
+          activeSubs.forEach((sub, i) => {
+            const metrics = ctx.measureText(sub.text);
+            const padding = 20;
+            const rectWidth = metrics.width + padding * 2;
+            const rectHeight = canvas.height * 0.07;
+            ctx.fillRect(canvas.width / 2 - rectWidth / 2, canvas.height * 0.85 - rectHeight / 2 + (i * rectHeight * 1.2), rectWidth, rectHeight);
+            ctx.fillStyle = 'white';
+            ctx.fillText(sub.text, canvas.width / 2, canvas.height * 0.85 + (i * rectHeight * 1.2) + 10);
+          });
+        }
+
+        // Voiceovers
+        videoState.voiceovers.forEach(v => {
+          if (!triggeredVoiceovers.has(v.id) && Math.abs(globalTime - v.startTime) < 0.1) {
+            triggeredVoiceovers.add(v.id);
+            console.log(`Triggering voiceover: ${v.id}`);
+            const audio = new Audio(v.url);
+            const source = audioCtx.createMediaElementSource(audio);
+            source.connect(masterGain);
+            audio.play();
+            voiceoverAudios.push(audio);
+          }
+        });
+
+        // Draw Watermark in top right corner
+        if (watermarkImg) {
+          const padding = canvas.width * 0.03;
+          const sizePercentage = (videoState.watermarkSize || 15) / 100;
+          const size = canvas.width * sizePercentage;
+          const aspect = watermarkImg.width / watermarkImg.height;
+          let drawW = size;
+          let drawH = size / aspect;
+          
+          if (drawH > size) {
+            drawH = size;
+            drawW = size * aspect;
+          }
+          
+          ctx.globalAlpha = 0.8; // Slight transparency
+          ctx.drawImage(watermarkImg, canvas.width - drawW - padding, padding, drawW, drawH);
+          ctx.globalAlpha = 1.0;
+        }
+
+        setExportProgress((globalTime / (totalDuration || 1)) * 100);
+
+        // Completion check: within 0.1s of end OR video naturally ended
+        if ((localTime >= clip.trimEnd - 0.1) || video.ended) {
+          console.log(`Clip ${currentClipIndex + 1} completion triggered. LocalTime: ${localTime.toFixed(2)}, TrimEnd: ${clip.trimEnd.toFixed(2)}, Ended: ${video.ended}`);
+          video.pause();
+          currentClipIndex++;
+          
+          if (currentClipIndex < videoState.clips.length) {
+            processClip(currentClipIndex);
+          } else {
+            console.log("All clips finished. Finalizing export...");
+            activeExport = false;
+            if (recorder.state !== 'inactive') {
+              recorder.stop();
+            }
+            return;
+          }
+        }
+      } else {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = 'white';
+        ctx.font = '30px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Preparing next segment...', canvas.width / 2, canvas.height / 2);
+      }
+
+      // Robust loop
+      if (document.hidden) {
+        setTimeout(renderFrame, 16);
       } else {
         requestAnimationFrame(renderFrame);
       }
     };
 
-    video.play().then(() => {
-      renderFrame();
-    });
+    renderFrame();
   };
 
   const addVoiceover = (url: string, type: 'recorded' | 'ai', text?: string) => {
@@ -306,7 +581,7 @@ export default function App() {
       id: Math.random().toString(36).substr(2, 9),
       text: 'New Subtitle',
       start: currentTime,
-      end: Math.min(currentTime + 3, videoState.trimEnd)
+      end: Math.min(currentTime + 3, totalDuration)
     };
     setVideoState(prev => ({
       ...prev,
@@ -351,7 +626,7 @@ export default function App() {
     });
   }, [currentTime, isPlaying, videoState.voiceovers]);
 
-  if (!videoState.url) {
+  if (videoState.clips.length === 0) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center p-6 bg-bg">
         <motion.div 
@@ -397,14 +672,18 @@ export default function App() {
         </div>
         <div className="flex items-center gap-4">
           {isExporting && (
-            <div className="flex items-center gap-3 px-4 py-1.5 bg-white/5 rounded-full border border-white/10">
-              <div className="w-20 h-1.5 bg-white/10 rounded-full overflow-hidden">
-                <div 
-                  className="h-full bg-accent transition-all duration-300"
-                  style={{ width: `${exportProgress}%` }}
-                />
+            <div className="flex flex-col items-end gap-1">
+              <div className="flex items-center gap-3 px-4 py-1.5 bg-white/5 rounded-full border border-white/10">
+                <span className="text-[9px] font-bold text-accent/60 uppercase tracking-widest">Recording</span>
+                <div className="w-20 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-accent transition-all duration-300"
+                    style={{ width: `${exportProgress}%` }}
+                  />
+                </div>
+                <span className="text-[10px] font-mono text-accent font-bold">{Math.round(exportProgress)}%</span>
               </div>
-              <span className="text-[10px] font-mono text-accent font-bold">{Math.round(exportProgress)}%</span>
+              <span className="text-[9px] text-slate-500 font-medium animate-pulse">Keep tab active for faster export</span>
             </div>
           )}
           <button 
@@ -449,6 +728,12 @@ export default function App() {
             icon={<Type className="w-5 h-5" />}
             label="Subs"
           />
+          <ToolButton 
+            active={activeTab === 'watermark'} 
+            onClick={() => setActiveTab('watermark')}
+            icon={<ImageIcon className="w-5 h-5" />}
+            label="Logo"
+          />
         </aside>
 
         {/* Center: Preview & Timeline */}
@@ -457,8 +742,9 @@ export default function App() {
             <div className="relative max-w-4xl w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-white/5">
               <video 
                 ref={videoRef}
-                src={videoState.url}
-                onLoadedMetadata={onLoadedMetadata}
+                key={selectedClip?.id}
+                src={selectedClip?.url || undefined}
+                onLoadedMetadata={() => selectedClip && onLoadedMetadata(selectedClip.id)}
                 onTimeUpdate={handleTimeUpdate}
                 className="w-full h-full object-contain"
                 onClick={togglePlay}
@@ -480,6 +766,21 @@ export default function App() {
                   </motion.div>
                 ))}
               </AnimatePresence>
+
+              {/* Watermark Overlay */}
+              {videoState.watermarkUrl && (
+                <div 
+                  className="absolute top-4 right-4 pointer-events-none"
+                  style={{ width: `${videoState.watermarkSize || 15}%`, height: 'auto', maxWidth: '30%' }}
+                >
+                  <img 
+                    src={videoState.watermarkUrl} 
+                    alt="Watermark" 
+                    className="w-full h-full object-contain opacity-80"
+                    referrerPolicy="no-referrer"
+                  />
+                </div>
+              )}
 
               {/* Playback Overlay */}
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -509,23 +810,29 @@ export default function App() {
               <div className="flex-1 space-y-2">
                 <div className="flex justify-between text-xs font-mono text-slate-500">
                   <span>{formatTime(currentTime)}</span>
-                  <span>{formatTime(videoState.duration)}</span>
+                  <span>{formatTime(totalDuration)}</span>
                 </div>
                 <div className="relative h-2 bg-white/10 rounded-full overflow-hidden group cursor-pointer">
                   <div 
                     className="absolute inset-y-0 left-0 bg-accent transition-all duration-100"
-                    style={{ width: `${(currentTime / videoState.duration) * 100}%` }}
+                    style={{ width: `${(currentTime / (totalDuration || 1)) * 100}%` }}
                   />
                   <input 
                     type="range"
                     min="0"
-                    max={videoState.duration}
+                    max={totalDuration}
                     step="0.1"
                     value={currentTime}
                     onChange={(e) => {
-                      const time = parseFloat(e.target.value);
-                      if (videoRef.current) videoRef.current.currentTime = time;
-                      setCurrentTime(time);
+                      const globalTime = parseFloat(e.target.value);
+                      const clipInfo = getClipAtTime(globalTime);
+                      if (clipInfo) {
+                        if (clipInfo.clip.id !== selectedClipId) {
+                          setSelectedClipId(clipInfo.clip.id);
+                        }
+                        if (videoRef.current) videoRef.current.currentTime = clipInfo.localTime;
+                      }
+                      setCurrentTime(globalTime);
                     }}
                     className="absolute inset-0 w-full opacity-0 cursor-pointer"
                   />
@@ -533,21 +840,57 @@ export default function App() {
               </div>
             </div>
 
-            {/* Trim Visualizer */}
-            <div className="relative h-12 bg-white/5 rounded-xl border border-white/10 overflow-hidden">
-               <div 
-                className="absolute inset-y-0 bg-accent/20 border-x border-accent"
-                style={{ 
-                  left: `${(videoState.trimStart / videoState.duration) * 100}%`,
-                  right: `${100 - (videoState.trimEnd / videoState.duration) * 100}%`
-                }}
-               />
+            {/* Timeline Visualizer */}
+            <div 
+              ref={timelineRef}
+              className="relative h-12 bg-white/5 rounded-xl border border-white/10 overflow-hidden flex select-none"
+            >
+               {videoState.clips.map(clip => (
+                 <div 
+                  key={clip.id}
+                  className={cn(
+                    "h-full border-r border-white/10 relative transition-all group/clip",
+                    selectedClipId === clip.id ? "bg-accent/20" : "bg-white/5"
+                  )}
+                  style={{ width: `${((clip.trimEnd - clip.trimStart) / (totalDuration || 1)) * 100}%` }}
+                  onClick={() => setSelectedClipId(clip.id)}
+                 >
+                   {/* Drag Handles for Selected Clip */}
+                   {selectedClipId === clip.id && (
+                     <>
+                       <div 
+                        className="absolute left-0 top-0 bottom-0 w-2 bg-accent cursor-col-resize z-20 flex items-center justify-center group-hover/clip:opacity-100 transition-opacity"
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setDraggingHandle({ clipId: clip.id, type: 'start' });
+                        }}
+                       >
+                         <div className="w-0.5 h-4 bg-white/50 rounded-full" />
+                       </div>
+                       <div 
+                        className="absolute right-0 top-0 bottom-0 w-2 bg-accent cursor-col-resize z-20 flex items-center justify-center group-hover/clip:opacity-100 transition-opacity"
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setDraggingHandle({ clipId: clip.id, type: 'end' });
+                        }}
+                       >
+                         <div className="w-0.5 h-4 bg-white/50 rounded-full" />
+                       </div>
+                     </>
+                   )}
+                   
+                   <div className="absolute inset-0 flex items-center justify-center opacity-20 pointer-events-none">
+                     <Scissors className="w-4 h-4" />
+                   </div>
+                 </div>
+               ))}
+               
                {/* Markers for voiceovers and subs */}
                {videoState.voiceovers.map(v => (
                  <div 
                   key={v.id}
                   className="absolute top-0 bottom-0 w-1 bg-yellow-500/50"
-                  style={{ left: `${(v.startTime / videoState.duration) * 100}%` }}
+                  style={{ left: `${(v.startTime / (totalDuration || 1)) * 100}%` }}
                  />
                ))}
             </div>
@@ -567,42 +910,108 @@ export default function App() {
             {activeTab === 'trim' && (
               <div className="space-y-6">
                 <div className="space-y-4">
-                  <label className="text-sm font-medium text-slate-400">Start Time</label>
-                  <div className="flex items-center gap-4">
-                    <input 
-                      type="number" 
-                      value={videoState.trimStart.toFixed(2)}
-                      onChange={(e) => setVideoState(prev => ({ ...prev, trimStart: Math.max(0, parseFloat(e.target.value)) }))}
-                      className="flex-1 bg-white/5 border border-border rounded-lg px-3 py-2 text-sm font-mono"
-                    />
-                    <button 
-                      onClick={() => setVideoState(prev => ({ ...prev, trimStart: currentTime }))}
-                      className="p-2 bg-accent/10 text-accent rounded-lg hover:bg-accent/20"
-                    >
-                      <Save className="w-4 h-4" />
-                    </button>
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">Clips</h3>
+                  <div className="space-y-2">
+                    {videoState.clips.map((clip, index) => (
+                      <div 
+                        key={clip.id}
+                        onClick={() => setSelectedClipId(clip.id)}
+                        className={cn(
+                          "group flex items-center gap-3 p-3 rounded-xl border transition-all cursor-pointer",
+                          selectedClipId === clip.id 
+                            ? "bg-accent/10 border-accent/30" 
+                            : "bg-white/5 border-white/10 hover:bg-white/10"
+                        )}
+                      >
+                        <div className="w-8 h-8 bg-white/10 rounded flex items-center justify-center text-xs font-bold">
+                          {index + 1}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-medium truncate">Clip {index + 1}</div>
+                          <div className="text-[10px] text-slate-500 font-mono">
+                            {formatTime(clip.trimEnd - clip.trimStart)}
+                          </div>
+                        </div>
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setVideoState(prev => ({
+                              ...prev,
+                              clips: prev.clips.filter(c => c.id !== clip.id)
+                            }));
+                            if (selectedClipId === clip.id) setSelectedClipId(null);
+                          }}
+                          className="p-1.5 hover:bg-red-500/20 text-slate-500 hover:text-red-500 rounded-lg opacity-0 group-hover:opacity-100 transition-all"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                    
+                    <label className="w-full py-3 bg-white/5 hover:bg-white/10 border border-dashed border-white/20 rounded-xl font-bold flex items-center justify-center gap-2 cursor-pointer transition-all">
+                      <Plus className="w-4 h-4" />
+                      <span className="text-sm">Add Clip</span>
+                      <input 
+                        type="file" 
+                        accept="video/*" 
+                        multiple
+                        onChange={handleFileUpload}
+                        className="hidden"
+                      />
+                    </label>
                   </div>
                 </div>
-                <div className="space-y-4">
-                  <label className="text-sm font-medium text-slate-400">End Time</label>
-                  <div className="flex items-center gap-4">
-                    <input 
-                      type="number" 
-                      value={videoState.trimEnd.toFixed(2)}
-                      onChange={(e) => setVideoState(prev => ({ ...prev, trimEnd: Math.min(videoState.duration, parseFloat(e.target.value)) }))}
-                      className="flex-1 bg-white/5 border border-border rounded-lg px-3 py-2 text-sm font-mono"
-                    />
-                    <button 
-                      onClick={() => setVideoState(prev => ({ ...prev, trimEnd: currentTime }))}
-                      className="p-2 bg-accent/10 text-accent rounded-lg hover:bg-accent/20"
-                    >
-                      <Save className="w-4 h-4" />
-                    </button>
+
+                {selectedClip && (
+                  <div className="space-y-6 pt-6 border-t border-border">
+                    <div className="space-y-4">
+                      <label className="text-sm font-medium text-slate-400">Start Time</label>
+                      <div className="flex items-center gap-4">
+                        <input 
+                          type="number" 
+                          value={selectedClip.trimStart.toFixed(2)}
+                          onChange={(e) => setVideoState(prev => ({ 
+                            ...prev, 
+                            clips: prev.clips.map(c => c.id === selectedClip.id ? { ...c, trimStart: Math.max(0, parseFloat(e.target.value)) } : c)
+                          }))}
+                          className="flex-1 bg-white/5 border border-border rounded-lg px-3 py-2 text-sm font-mono"
+                        />
+                        <button 
+                          onClick={() => setVideoState(prev => ({ 
+                            ...prev, 
+                            clips: prev.clips.map(c => c.id === selectedClip.id ? { ...c, trimStart: currentTime } : c)
+                          }))}
+                          className="p-2 bg-accent/10 text-accent rounded-lg hover:bg-accent/20"
+                        >
+                          <Save className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="space-y-4">
+                      <label className="text-sm font-medium text-slate-400">End Time</label>
+                      <div className="flex items-center gap-4">
+                        <input 
+                          type="number" 
+                          value={selectedClip.trimEnd.toFixed(2)}
+                          onChange={(e) => setVideoState(prev => ({ 
+                            ...prev, 
+                            clips: prev.clips.map(c => c.id === selectedClip.id ? { ...c, trimEnd: Math.min(c.duration, parseFloat(e.target.value)) } : c)
+                          }))}
+                          className="flex-1 bg-white/5 border border-border rounded-lg px-3 py-2 text-sm font-mono"
+                        />
+                        <button 
+                          onClick={() => setVideoState(prev => ({ 
+                            ...prev, 
+                            clips: prev.clips.map(c => c.id === selectedClip.id ? { ...c, trimEnd: currentTime } : c)
+                          }))}
+                          className="p-2 bg-accent/10 text-accent rounded-lg hover:bg-accent/20"
+                        >
+                          <Save className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <p className="text-xs text-slate-500 leading-relaxed">
-                  Trimming will loop the video between the selected points during preview.
-                </p>
+                )}
               </div>
             )}
 
@@ -767,6 +1176,89 @@ export default function App() {
                       />
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'watermark' && (
+              <div className="space-y-8">
+                <div className="space-y-4">
+                  <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500">Watermark Logo</h3>
+                  <p className="text-xs text-slate-400">Add a logo to the top right corner of your video.</p>
+                  
+                  <div className="flex flex-col gap-4">
+                    {!videoState.watermarkUrl ? (
+                      <label className="w-full py-8 bg-white/5 hover:bg-white/10 border border-dashed border-white/20 rounded-2xl font-bold flex flex-col items-center justify-center gap-3 cursor-pointer transition-all group">
+                        <div className="w-12 h-12 bg-accent/10 rounded-full flex items-center justify-center group-hover:scale-110 transition-transform">
+                          <Upload className="w-6 h-6 text-accent" />
+                        </div>
+                        <span className="text-sm">Upload Logo</span>
+                        <input 
+                          type="file" 
+                          accept="image/*" 
+                          onChange={handleWatermarkUpload}
+                          className="hidden"
+                        />
+                      </label>
+                    ) : (
+                      <div className="space-y-4">
+                        <div className="relative aspect-square bg-white/5 rounded-2xl border border-white/10 overflow-hidden group">
+                          <img 
+                            src={videoState.watermarkUrl} 
+                            alt="Watermark Preview" 
+                            className="w-full h-full object-contain p-4"
+                            referrerPolicy="no-referrer"
+                          />
+                          <button 
+                            onClick={() => setVideoState(prev => ({ ...prev, watermarkUrl: undefined }))}
+                            className="absolute top-2 right-2 p-2 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 transition-all hover:bg-red-600"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                        <label className="w-full py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl font-bold flex items-center justify-center gap-2 cursor-pointer transition-all">
+                          <Upload className="w-4 h-4" />
+                          <span className="text-sm">Change Logo</span>
+                          <input 
+                            type="file" 
+                            accept="image/*" 
+                            onChange={handleWatermarkUpload}
+                            className="hidden"
+                          />
+                        </label>
+
+                        <div className="space-y-3 pt-4 border-t border-white/5">
+                          <div className="flex justify-between items-center">
+                            <span className="text-xs font-bold text-slate-400">Logo Size</span>
+                            <span className="text-xs font-mono text-accent">{videoState.watermarkSize}%</span>
+                          </div>
+                          <input 
+                            type="range"
+                            min="5"
+                            max="30"
+                            step="1"
+                            value={videoState.watermarkSize || 15}
+                            onChange={(e) => setVideoState(prev => ({ ...prev, watermarkSize: parseInt(e.target.value) }))}
+                            className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-accent"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="p-4 bg-accent/10 rounded-2xl border border-accent/20">
+                  <div className="flex gap-3">
+                    <div className="w-8 h-8 bg-accent/20 rounded-lg flex items-center justify-center shrink-0">
+                      <Save className="w-4 h-4 text-accent" />
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs font-bold text-accent">Pro Tip</div>
+                      <div className="text-[10px] text-slate-400 leading-relaxed">
+                        Use a PNG with a transparent background for the best look. The logo will be placed in the top right corner with 80% opacity.
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
