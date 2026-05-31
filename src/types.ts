@@ -8,7 +8,9 @@ export interface Subtitle {
 export interface Voiceover {
   id: string;
   url: string;
-  startTime: number;
+  file?: File | Blob;
+  clipId?: string; // Optional for backward compatibility, but preferred
+  relativeStartTime: number; // Time relative to the clip's start (trimStart)
   type: 'recorded' | 'ai';
   text?: string;
 }
@@ -16,9 +18,11 @@ export interface Voiceover {
 export interface VideoClip {
   id: string;
   url: string;
+  file?: File | Blob;
   duration: number;
   trimStart: number;
   trimEnd: number;
+  type: 'video' | 'image';
 }
 
 export interface VideoState {
