@@ -1750,6 +1750,9 @@ function VidoCutApp() {
             />
           </div>
           <span className="font-bold text-lg tracking-tight">VidoCut</span>
+          <span className="px-2 py-0.5 rounded-full bg-green-500/20 border border-green-500/40 text-green-400 text-[10px] font-mono font-semibold tracking-tight">
+            {__APP_VERSION__}
+          </span>
         </div>
 
         <div className="flex items-center gap-3">
