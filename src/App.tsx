@@ -391,7 +391,7 @@ export default function App() {
   const onLoadedMetadata = (id: string) => {
     const clip = videoState.clips.find(c => c.id === id);
     if (clip?.type === 'image') return;
-    
+
     if (videoRef.current) {
       const duration = videoRef.current.duration;
       if (isFinite(duration)) {
@@ -399,6 +399,16 @@ export default function App() {
           ...prev,
           clips: prev.clips.map(c => c.id === id ? { ...c, duration, trimEnd: duration } : c),
         }));
+      }
+
+      // The <video> element is keyed by clip id, so advancing to the next clip
+      // remounts a fresh (paused) element. If a play-through is in progress,
+      // seek to this clip's trim start and resume so playback spans all tracks.
+      if (isPlaying) {
+        if (clip && isFinite(clip.trimStart)) {
+          videoRef.current.currentTime = clip.trimStart;
+        }
+        videoRef.current.play().catch(() => {});
       }
     }
   };
@@ -498,24 +508,42 @@ export default function App() {
     return () => cancelAnimationFrame(frameId);
   }, [isPlaying, selectedClipId, selectedClip?.trimEnd, videoState.clips]);
 
+  // Advance to the next clip on the timeline, or stop if this is the last clip.
+  // Shared by the trimmed-end path (handleTimeUpdate) and the natural-end path
+  // (handleVideoEnded), because a clip whose trimEnd equals its real duration
+  // fires `ended` before handleTimeUpdate ever reports localTime >= trimEnd.
+  const advancePastClip = (clip: VideoClip) => {
+    const globalEnd = getGlobalTime(clip.id, clip.trimEnd);
+    const nextClipInfo = getClipAtTime(globalEnd + 0.01);
+    if (nextClipInfo && nextClipInfo.clip.id !== clip.id) {
+      // The <video> is keyed by clip id, so this remounts a fresh element;
+      // its onLoadedMetadata resumes playback while isPlaying is true.
+      setCurrentTime(globalEnd);
+      setSelectedClipId(nextClipInfo.clip.id);
+    } else {
+      if (videoRef.current && isFinite(clip.trimStart)) {
+        videoRef.current.currentTime = clip.trimStart;
+      }
+      pauseAllPlayback();
+    }
+  };
+
   const handleTimeUpdate = () => {
     if (videoRef.current && selectedClip) {
       const localTime = videoRef.current.currentTime;
       const globalTime = getGlobalTime(selectedClip.id, localTime);
       setCurrentTime(globalTime);
-      
-      // Handle clip transition or end
+
+      // Trimmed clip: advance before the underlying file ends.
       if (localTime >= selectedClip.trimEnd) {
-        const nextClipInfo = getClipAtTime(globalTime + 0.01);
-        if (nextClipInfo && nextClipInfo.clip.id !== selectedClip.id) {
-          setSelectedClipId(nextClipInfo.clip.id);
-        } else {
-          if (isFinite(selectedClip.trimStart)) {
-            videoRef.current.currentTime = selectedClip.trimStart;
-          }
-          pauseAllPlayback();
-        }
+        advancePastClip(selectedClip);
       }
+    }
+  };
+
+  const handleVideoEnded = () => {
+    if (selectedClip) {
+      advancePastClip(selectedClip);
     }
   };
 
@@ -1867,6 +1895,7 @@ export default function App() {
                     muted={selectedClip.muted}
                     onLoadedMetadata={() => onLoadedMetadata(selectedClip.id)}
                     onTimeUpdate={handleTimeUpdate}
+                    onEnded={handleVideoEnded}
                     className="max-h-full max-w-full object-contain"
                     onClick={togglePlay}
                   />
