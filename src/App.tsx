@@ -1,7 +1,7 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Play, Pause, Square, RotateCcw, SkipBack, Scissors, Mic, Type, Download, 
-  Trash2, Plus, Volume2, VolumeX, Music, Wand2, Upload, ChevronRight, 
+import React, { useState, useRef, useEffect, createContext, useContext } from 'react';
+import {
+  Play, Pause, Square, RotateCcw, SkipBack, Scissors, Mic, Type, Download,
+  Trash2, Plus, Volume2, VolumeX, Music, Wand2, Upload, ChevronRight,
   ChevronLeft, X, Save, Image as ImageIcon, GripVertical, ZoomIn, ZoomOut, Maximize2,
   Copy, AlignLeft, AlignCenter, AlignRight, Sliders, Sparkles, FolderDown, FolderUp, FolderOpen
 } from 'lucide-react';
@@ -11,12 +11,163 @@ import { generateAIVoice } from './services/gemini';
 import { Subtitle, Voiceover, VideoState, VideoClip } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { Login } from './components/Login';
+import { readStoredUser, type AuthUser } from './lib/auth';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export default function App() {
+const MAGIC_BASE = 'https://cookie.vegvisr.org';
+const DASHBOARD_BASE = 'https://dashboard.vegvisr.org';
+
+const AuthContext = createContext<AuthUser | null>(null);
+
+function AuthGate({ children }: { children: React.ReactNode }) {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authStatus, setAuthStatus] = useState<'checking' | 'authed' | 'anonymous'>('checking');
+
+  const setAuthCookie = (token: string) => {
+    if (!token) return;
+    const isVegvisr = window.location.hostname.endsWith('vegvisr.org');
+    const domain = isVegvisr ? '; Domain=.vegvisr.org' : '';
+    const maxAge = 60 * 60 * 24 * 30;
+    document.cookie = `vegvisr_token=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; SameSite=Lax; Secure${domain}`;
+  };
+
+  const persistUser = (user: {
+    email: string;
+    role: string;
+    user_id: string | null;
+    emailVerificationToken: string | null;
+    oauth_id?: string | null;
+  }) => {
+    const payload = {
+      email: user.email,
+      role: user.role,
+      user_id: user.user_id,
+      oauth_id: user.oauth_id || user.user_id || null,
+      emailVerificationToken: user.emailVerificationToken,
+    };
+    localStorage.setItem('user', JSON.stringify(payload));
+    if (user.emailVerificationToken) setAuthCookie(user.emailVerificationToken);
+    sessionStorage.setItem('email_session_verified', '1');
+    setAuthUser({
+      userId: payload.user_id || payload.oauth_id || '',
+      email: payload.email,
+      role: payload.role || null,
+    });
+  };
+
+  const fetchUserContext = async (targetEmail: string) => {
+    const roleRes = await fetch(`${DASHBOARD_BASE}/get-role?email=${encodeURIComponent(targetEmail)}`);
+    if (!roleRes.ok) throw new Error(`User role unavailable (status: ${roleRes.status})`);
+    const roleData = await roleRes.json();
+    if (!roleData?.role) throw new Error('Unable to retrieve user role.');
+    const userDataRes = await fetch(`${DASHBOARD_BASE}/userdata?email=${encodeURIComponent(targetEmail)}`);
+    if (!userDataRes.ok) throw new Error(`Unable to fetch user data (status: ${userDataRes.status})`);
+    const userData = await userDataRes.json();
+    return {
+      email: targetEmail,
+      role: roleData.role,
+      user_id: userData.user_id,
+      emailVerificationToken: userData.emailVerificationToken,
+      oauth_id: userData.oauth_id,
+    };
+  };
+
+  const verifyMagicToken = async (token: string) => {
+    const res = await fetch(`${MAGIC_BASE}/login/magic/verify?token=${encodeURIComponent(token)}`);
+    const data = await res.json();
+    if (!res.ok || !data.success || !data.email) throw new Error(data.error || 'Invalid or expired magic link.');
+    try {
+      const userContext = await fetchUserContext(data.email);
+      persistUser(userContext);
+    } catch {
+      persistUser({ email: data.email, role: 'user', user_id: data.email, emailVerificationToken: null });
+    }
+  };
+
+  const clearAuthCookie = () => {
+    const base = 'vegvisr_token=; Path=/; Max-Age=0; SameSite=Lax; Secure';
+    document.cookie = base;
+    if (window.location.hostname.endsWith('vegvisr.org')) {
+      document.cookie = `${base}; Domain=.vegvisr.org`;
+    }
+  };
+
+  const handleLogout = () => {
+    try {
+      localStorage.removeItem('user');
+      sessionStorage.removeItem('email_session_verified');
+    } catch { /* ignore */ }
+    clearAuthCookie();
+    setAuthUser(null);
+    setAuthStatus('anonymous');
+  };
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const magic = url.searchParams.get('magic');
+    if (!magic) return;
+    setAuthStatus('checking');
+    verifyMagicToken(magic)
+      .then(() => {
+        url.searchParams.delete('magic');
+        window.history.replaceState({}, '', url.toString());
+        setAuthStatus('authed');
+      })
+      .catch(() => setAuthStatus('anonymous'));
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    const stored = readStoredUser();
+    if (stored && isMounted) {
+      setAuthUser(stored);
+      setAuthStatus('authed');
+    } else if (isMounted) {
+      setAuthStatus('anonymous');
+    }
+    return () => { isMounted = false; };
+  }, []);
+
+  if (authStatus === 'authed') {
+    return (
+      <AuthContext.Provider value={authUser}>
+        <div className="flex flex-col h-screen">
+          <div className="flex-shrink-0 border-b border-slate-800 bg-slate-900 px-4 py-1.5 flex items-center justify-end">
+            <span className="text-xs text-slate-400 mr-3">{authUser?.email}</span>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="text-xs text-slate-300 hover:text-white border border-slate-700 hover:border-slate-500 rounded-md px-2.5 py-1 transition-colors"
+            >
+              Log out
+            </button>
+          </div>
+          {children}
+        </div>
+      </AuthContext.Provider>
+    );
+  }
+
+  if (authStatus === 'anonymous') {
+    return <Login />;
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white text-sm">
+      Checking session...
+    </div>
+  );
+}
+
+export function useAuthUser() {
+  return useContext(AuthContext);
+}
+
+function VidoCutApp() {
   const [videoState, setVideoState] = useState<VideoState>({
     clips: [],
     subtitles: [],
@@ -3616,4 +3767,12 @@ function formatTime(seconds: number) {
   const secs = Math.floor(seconds % 60);
   const ms = Math.floor((seconds % 1) * 100);
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+}
+
+export default function App() {
+  return (
+    <AuthGate>
+      <VidoCutApp />
+    </AuthGate>
+  );
 }
