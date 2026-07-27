@@ -13,7 +13,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Login } from './components/Login';
 import { readStoredUser, type AuthUser } from './lib/auth';
-import { loadFFmpeg, writeFrame, writeAudioInput, deleteFile, buildFfmpegCommand, runEncode, readOutput, encodeFrameSequence, encodePassthroughVideoSegment, encodePassthroughImageSegment, concatSegments, type AudioInput } from './lib/ffmpegExport';
+import { loadFFmpeg, writeFrame, writeAudioInput, deleteFile, buildFfmpegCommand, runEncode, readOutput, encodePassthroughVideoSegment, encodePassthroughImageSegment, concatSegments, encodeOverlayPass, type AudioInput } from './lib/ffmpegExport';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -1055,10 +1055,13 @@ function VidoCutApp() {
     e.target.value = '';
   };
 
-  // Offline export: render every timeline frame to a PNG (decoupled from
-  // wall-clock/playback speed), mux via ffmpeg.wasm. Unlike the old
-  // captureStream()+MediaRecorder path, export time is CPU-bound, not
-  // playback-duration-bound.
+  // Offline export via ffmpeg.wasm, decoupled from wall-clock/playback
+  // speed. Each clip is trimmed once (stream-copy when the source already
+  // matches the export resolution — a fast remux, not a re-encode) and
+  // concatenated; subtitles/watermark are pre-rendered ONCE each as
+  // transparent PNGs (their content doesn't change while on screen) and
+  // burned in via ffmpeg's own `overlay` filter, time-gated per subtitle.
+  // No per-frame canvas rendering, no discrete video seeking.
   const handleExport = async () => {
     if (videoState.clips.length === 0) return;
 
@@ -1087,7 +1090,6 @@ function VidoCutApp() {
     try {
       await loadFFmpeg((p) => setExportProgress(p.percent * 0.05)); // 0-5%
 
-      // Watermark image (drawn every frame, load once)
       let watermarkImg: HTMLImageElement | null = null;
       if (videoState.watermarkUrl) {
         watermarkImg = new Image();
@@ -1099,117 +1101,105 @@ function VidoCutApp() {
         });
       }
 
-      const drawSubtitlesAndWatermark = (globalTime: number) => {
-        const activeSubs = showSubtitles ? videoState.subtitles.filter(s => globalTime >= s.start && globalTime <= s.end) : [];
-        activeSubs.forEach((sub, i) => {
-          const relFontSize = (sub.fontSize || 24) * (canvas.height / 500);
-          const weight = sub.fontWeight === 'extrabold' ? '800' : sub.fontWeight === 'bold' ? 'bold' : 'normal';
-          const style = sub.fontStyle === 'italic' ? 'italic' : 'normal';
-          ctx.font = `${style} ${weight} ${relFontSize}px Inter, sans-serif`;
+      // One-time probe of a clip's native resolution, to decide whether a
+      // pure stream-copy (no re-encode) is safe: it only works when the
+      // source is already exactly at the export's target dimensions.
+      const getVideoDimensions = (url: string) => new Promise<{ width: number; height: number } | null>((resolve) => {
+        const probe = document.createElement('video');
+        probe.preload = 'metadata';
+        probe.onloadedmetadata = () => resolve({ width: probe.videoWidth, height: probe.videoHeight });
+        probe.onerror = () => resolve(null);
+        probe.src = url;
+        setTimeout(() => resolve(null), 5000);
+      });
 
-          const metrics = ctx.measureText(sub.text || '');
-          const padding = relFontSize * 0.5;
-          const rectWidth = metrics.width + padding * 2;
-          const rectHeight = relFontSize * 1.4;
+      // Draw one subtitle's box+text onto the (already-cleared, transparent)
+      // canvas. Reused both to pre-render each subtitle's overlay PNG.
+      const drawSubtitleOnly = (sub: Subtitle) => {
+        const relFontSize = (sub.fontSize || 24) * (canvas.height / 500);
+        const weight = sub.fontWeight === 'extrabold' ? '800' : sub.fontWeight === 'bold' ? 'bold' : 'normal';
+        const style = sub.fontStyle === 'italic' ? 'italic' : 'normal';
+        ctx.font = `${style} ${weight} ${relFontSize}px Inter, sans-serif`;
 
-          let posY = canvas.height * 0.85;
-          if (sub.positionY === 'top') posY = canvas.height * 0.15;
-          else if (sub.positionY === 'center') posY = canvas.height * 0.5;
-          posY += i * (rectHeight + 10);
+        const metrics = ctx.measureText(sub.text || '');
+        const padding = relFontSize * 0.5;
+        const rectWidth = metrics.width + padding * 2;
+        const rectHeight = relFontSize * 1.4;
 
-          let posX = canvas.width / 2;
-          const align: CanvasTextAlign = 'center';
-          if (sub.positionX === 'left') posX = canvas.width * 0.08 + rectWidth / 2;
-          else if (sub.positionX === 'right') posX = canvas.width * 0.92 - rectWidth / 2;
+        let posY = canvas.height * 0.85;
+        if (sub.positionY === 'top') posY = canvas.height * 0.15;
+        else if (sub.positionY === 'center') posY = canvas.height * 0.5;
 
-          const bg = sub.backgroundColor || 'rgba(0, 0, 0, 0.75)';
-          if (bg !== 'transparent') {
-            ctx.fillStyle = bg;
-            ctx.fillRect(posX - rectWidth / 2, posY - rectHeight / 2, rectWidth, rectHeight);
-          }
+        let posX = canvas.width / 2;
+        const align: CanvasTextAlign = 'center';
+        if (sub.positionX === 'left') posX = canvas.width * 0.08 + rectWidth / 2;
+        else if (sub.positionX === 'right') posX = canvas.width * 0.92 - rectWidth / 2;
 
-          if (sub.hasShadow !== false) {
-            ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
-            ctx.shadowBlur = 8;
-            ctx.shadowOffsetX = 2;
-            ctx.shadowOffsetY = 2;
-          } else {
-            ctx.shadowColor = 'transparent';
-          }
-
-          ctx.fillStyle = sub.color || '#ffffff';
-          ctx.textAlign = align;
-          ctx.textBaseline = 'middle';
-          ctx.fillText(sub.text || '', posX, posY);
-          ctx.shadowColor = 'transparent';
-        });
-
-        if (watermarkImg) {
-          const padding = canvas.width * 0.03;
-          const sizePercentage = (videoState.watermarkSize || 15) / 100;
-          const size = canvas.width * sizePercentage;
-          const aspect = watermarkImg.width / watermarkImg.height;
-          let drawW = size;
-          let drawH = size / aspect;
-          if (drawH > size) { drawH = size; drawW = size * aspect; }
-
-          const pos = videoState.watermarkPosition || 'top-right';
-          let drawX = canvas.width - drawW - padding;
-          let drawY = padding;
-          if (pos === 'top-left') { drawX = padding; drawY = padding; }
-          else if (pos === 'top-center') { drawX = (canvas.width - drawW) / 2; drawY = padding; }
-          else if (pos === 'bottom-left') { drawX = padding; drawY = canvas.height - drawH - padding; }
-          else if (pos === 'bottom-center') { drawX = (canvas.width - drawW) / 2; drawY = canvas.height - drawH - padding; }
-          else if (pos === 'bottom-right') { drawX = canvas.width - drawW - padding; drawY = canvas.height - drawH - padding; }
-          else if (pos === 'center') { drawX = (canvas.width - drawW) / 2; drawY = (canvas.height - drawH) / 2; }
-
-          ctx.globalAlpha = (videoState.watermarkOpacity ?? 80) / 100;
-          ctx.drawImage(watermarkImg, drawX, drawY, drawW, drawH);
-          ctx.globalAlpha = 1.0;
+        const bg = sub.backgroundColor || 'rgba(0, 0, 0, 0.75)';
+        if (bg !== 'transparent') {
+          ctx.fillStyle = bg;
+          ctx.fillRect(posX - rectWidth / 2, posY - rectHeight / 2, rectWidth, rectHeight);
         }
+
+        if (sub.hasShadow !== false) {
+          ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+          ctx.shadowBlur = 8;
+          ctx.shadowOffsetX = 2;
+          ctx.shadowOffsetY = 2;
+        } else {
+          ctx.shadowColor = 'transparent';
+        }
+
+        ctx.fillStyle = sub.color || '#ffffff';
+        ctx.textAlign = align;
+        ctx.textBaseline = 'middle';
+        ctx.fillText(sub.text || '', posX, posY);
+        ctx.shadowColor = 'transparent';
       };
 
-      // Offscreen video element reused across frames of the same clip; only
-      // reloaded when the clip changes, then seeked precisely per frame.
-      const frameVideo = document.createElement('video');
-      frameVideo.crossOrigin = 'anonymous';
-      frameVideo.muted = true;
-      frameVideo.playsInline = true;
-      let loadedClipId: string | null = null;
+      const drawWatermarkOnly = () => {
+        if (!watermarkImg) return;
+        const padding = canvas.width * 0.03;
+        const sizePercentage = (videoState.watermarkSize || 15) / 100;
+        const size = canvas.width * sizePercentage;
+        const aspect = watermarkImg.width / watermarkImg.height;
+        let drawW = size;
+        let drawH = size / aspect;
+        if (drawH > size) { drawH = size; drawW = size * aspect; }
 
-      const loadClipSrc = (url: string) => new Promise<void>((resolve) => {
-        const onCanPlay = () => { frameVideo.removeEventListener('canplay', onCanPlay); resolve(); };
-        frameVideo.addEventListener('canplay', onCanPlay);
-        frameVideo.src = url;
-        frameVideo.load();
-        setTimeout(() => { frameVideo.removeEventListener('canplay', onCanPlay); resolve(); }, 5000);
-      });
+        const pos = videoState.watermarkPosition || 'top-right';
+        let drawX = canvas.width - drawW - padding;
+        let drawY = padding;
+        if (pos === 'top-left') { drawX = padding; drawY = padding; }
+        else if (pos === 'top-center') { drawX = (canvas.width - drawW) / 2; drawY = padding; }
+        else if (pos === 'bottom-left') { drawX = padding; drawY = canvas.height - drawH - padding; }
+        else if (pos === 'bottom-center') { drawX = (canvas.width - drawW) / 2; drawY = canvas.height - drawH - padding; }
+        else if (pos === 'bottom-right') { drawX = canvas.width - drawW - padding; drawY = canvas.height - drawH - padding; }
+        else if (pos === 'center') { drawX = (canvas.width - drawW) / 2; drawY = (canvas.height - drawH) / 2; }
 
-      const seekTo = (t: number) => new Promise<void>((resolve) => {
-        if (Math.abs(frameVideo.currentTime - t) < 0.001 && frameVideo.readyState >= 2) { resolve(); return; }
-        const onSeeked = () => { frameVideo.removeEventListener('seeked', onSeeked); resolve(); };
-        frameVideo.addEventListener('seeked', onSeeked);
-        frameVideo.currentTime = t;
-        setTimeout(() => { frameVideo.removeEventListener('seeked', onSeeked); resolve(); }, 2000);
-      });
+        ctx.globalAlpha = (videoState.watermarkOpacity ?? 80) / 100;
+        ctx.drawImage(watermarkImg, drawX, drawY, drawW, drawH);
+        ctx.globalAlpha = 1.0;
+      };
 
-      const imageCache = new Map<string, HTMLImageElement>();
-      const loadImage = (url: string) => new Promise<HTMLImageElement>((resolve) => {
-        const cached = imageCache.get(url);
-        if (cached) { resolve(cached); return; }
-        const img = new Image();
-        img.onload = () => { imageCache.set(url, img); resolve(img); };
-        img.onerror = () => resolve(img);
-        img.src = url;
-      });
+      // Pre-render the watermark overlay once (position/size/opacity never
+      // change) — reused across every segment that needs it.
+      let watermarkOverlayName: string | null = null;
+      if (watermarkImg) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawWatermarkOnly();
+        const blob = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
+        watermarkOverlayName = 'watermark_overlay.png';
+        await writeFrame(watermarkOverlayName, blob);
+      }
 
       // Split each clip into sub-segments at subtitle boundaries. A segment
       // with no active subtitle (and no watermark, which applies globally)
-      // skips canvas entirely: the source video/image is trimmed straight
-      // through ffmpeg. Only segments that actually need something drawn on
-      // top go through the per-frame seek+draw+PNG path. For a long clip
-      // with just a few caption lines, this turns tens of thousands of
-      // browser-level video seeks into a handful of fast ffmpeg trims.
+      // stays a pure trim — stream-copied when the source already matches
+      // export resolution, so it costs seconds, not minutes. Only segments
+      // that actually need something drawn on top pay for a re-encode, and
+      // that re-encode is scoped to JUST that segment's own (usually short)
+      // duration via ffmpeg's overlay filter — not the whole timeline.
       const watermarkActive = !!videoState.watermarkUrl;
       type Segment = { clip: VideoClip; localStart: number; durationSec: number; needsOverlay: boolean };
       const segments: Segment[] = [];
@@ -1233,92 +1223,86 @@ function VidoCutApp() {
           const segStart = sorted[i];
           const segEnd = sorted[i + 1];
           const segDur = segEnd - segStart;
-          if (segDur < 0.02) continue; // skip degenerate slivers from boundary rounding
+          if (segDur < 0.02) continue;
           const midGlobal = clipGlobalStart + (segStart + segEnd) / 2;
           const needsOverlay = watermarkActive || (showSubtitles && videoState.subtitles.some(s => midGlobal >= s.start && midGlobal <= s.end));
           segments.push({ clip, localStart: segStart, durationSec: segDur, needsOverlay });
         }
       }
-      console.log(`Timeline split into ${segments.length} segment(s): ${segments.filter(s => !s.needsOverlay).length} passthrough, ${segments.filter(s => s.needsOverlay).length} rendered.`);
+      console.log(`Timeline split into ${segments.length} segment(s): ${segments.filter(s => !s.needsOverlay).length} passthrough, ${segments.filter(s => s.needsOverlay).length} need overlay.`);
 
       const writtenClipSources = new Set<string>();
       const segmentOutputs: string[] = [];
-      // Progress is weighted by segment DURATION, not segment count — a
-      // timeline with one 28-minute segment and two 5-second ones should not
-      // treat them as equal-sized steps, or the bar sits still for nearly
-      // the whole export while that one long segment encodes.
       const totalSegDuration = segments.reduce((acc, s) => acc + s.durationSec, 0) || 1;
       let cumulativeDuration = 0;
 
       for (let segIdx = 0; segIdx < segments.length; segIdx++) {
         const seg = segments[segIdx];
-        const outName = `seg_${String(segIdx).padStart(4, '0')}.mp4`;
+        const clipGlobalStart = getClipGlobalStart(seg.clip.id);
         const sourceStart = seg.clip.trimStart + seg.localStart;
         const segStartProgress = 5 + Math.round((cumulativeDuration / totalSegDuration) * 60);
         const segEndProgress = 5 + Math.round(((cumulativeDuration + seg.durationSec) / totalSegDuration) * 60);
-        console.log(`Segment ${segIdx + 1}/${segments.length}: ${seg.needsOverlay ? 'render' : 'passthrough'}, ${seg.durationSec.toFixed(1)}s`);
-
-        const onSegEncodeProgress = (ratio: number) => {
+        const onSegProgress = (ratio: number) => {
           const clamped = Math.max(0, Math.min(1, ratio));
           setExportProgress(segStartProgress + Math.round((segEndProgress - segStartProgress) * clamped));
         };
 
-        if (!seg.needsOverlay) {
-          // Skip canvas: hand the original file straight to ffmpeg.
-          const srcName = `clip_src_${seg.clip.id}`;
-          if (!writtenClipSources.has(srcName)) {
-            await writeAudioInput(srcName, seg.clip.file || seg.clip.url);
-            writtenClipSources.add(srcName);
-          }
-          if (seg.clip.type === 'video') {
-            await encodePassthroughVideoSegment(srcName, sourceStart, seg.durationSec, FPS, canvas.width, canvas.height, outName, onSegEncodeProgress);
-          } else {
-            await encodePassthroughImageSegment(srcName, seg.durationSec, FPS, canvas.width, canvas.height, outName, onSegEncodeProgress);
-          }
+        const srcName = `clip_src_${seg.clip.id}`;
+        if (!writtenClipSources.has(srcName)) {
+          await writeAudioInput(srcName, seg.clip.file || seg.clip.url);
+          writtenClipSources.add(srcName);
+        }
+
+        const trimmedName = `trim_${segIdx}.mp4`;
+        if (seg.clip.type === 'video') {
+          const dims = await getVideoDimensions(seg.clip.url);
+          const canStreamCopy = !!dims && dims.width === canvas.width && dims.height === canvas.height;
+          console.log(`Segment ${segIdx + 1}/${segments.length}: ${seg.needsOverlay ? 'overlay' : 'passthrough'}, ${seg.durationSec.toFixed(1)}s, ${canStreamCopy ? 'stream-copy' : 're-encode'} trim`);
+          await encodePassthroughVideoSegment(srcName, sourceStart, seg.durationSec, FPS, canvas.width, canvas.height, trimmedName, canStreamCopy, seg.needsOverlay ? undefined : onSegProgress);
         } else {
-          // Needs subtitle/watermark burned in: render every frame via canvas.
-          // Rendering gets 70% of this segment's progress band, encoding the
-          // PNG sequence gets the remaining 30%.
-          const frameCount = Math.max(1, Math.round(seg.durationSec * FPS));
-          const framePrefix = `s${segIdx}`;
-          for (let f = 0; f < frameCount; f++) {
-            const localTime = sourceStart + f / FPS;
-            const globalTime = getClipGlobalStart(seg.clip.id) + seg.localStart + f / FPS;
+          await encodePassthroughImageSegment(srcName, seg.durationSec, FPS, canvas.width, canvas.height, trimmedName, seg.needsOverlay ? undefined : onSegProgress);
+        }
 
-            if (seg.clip.type === 'video') {
-              if (loadedClipId !== seg.clip.id) {
-                await loadClipSrc(seg.clip.url);
-                loadedClipId = seg.clip.id;
-              }
-              await seekTo(localTime);
-              ctx.drawImage(frameVideo, 0, 0, canvas.width, canvas.height);
-            } else {
-              const img = await loadImage(seg.clip.url);
-              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-              loadedClipId = null;
+        let outName = trimmedName;
+        if (seg.needsOverlay) {
+          const overlays: { name: string; enableExpr: string | null }[] = [];
+          if (showSubtitles) {
+            for (let i = 0; i < videoState.subtitles.length; i++) {
+              const sub = videoState.subtitles[i];
+              const segGlobalStart = clipGlobalStart + seg.localStart;
+              const localSubStart = sub.start - segGlobalStart;
+              const localSubEnd = sub.end - segGlobalStart;
+              if (localSubEnd <= 0 || localSubStart >= seg.durationSec) continue; // not active in this segment
+
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              drawSubtitleOnly(sub);
+              const blob = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
+              const name = `subtitle_${segIdx}_${i}.png`;
+              await writeFrame(name, blob);
+              overlays.push({
+                name,
+                enableExpr: `between(t,${Math.max(0, localSubStart).toFixed(3)},${Math.min(seg.durationSec, localSubEnd).toFixed(3)})`,
+              });
             }
-
-            drawSubtitlesAndWatermark(globalTime);
-
-            const blob = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
-            await writeFrame(`${framePrefix}_${String(f).padStart(6, '0')}.png`, blob);
-
-            setExportProgress(segStartProgress + Math.round((segEndProgress - segStartProgress) * 0.7 * (f / frameCount)));
           }
-          await encodeFrameSequence(framePrefix, FPS, canvas.width, canvas.height, outName, (ratio) => {
-            const clamped = Math.max(0, Math.min(1, ratio));
-            setExportProgress(segStartProgress + Math.round((segEndProgress - segStartProgress) * (0.7 + 0.3 * clamped)));
-          });
-          for (let f = 0; f < frameCount; f++) {
-            await deleteFile(`${framePrefix}_${String(f).padStart(6, '0')}.png`);
+          if (watermarkOverlayName) {
+            overlays.push({ name: watermarkOverlayName, enableExpr: null });
+          }
+
+          outName = `overlay_${segIdx}.mp4`;
+          await encodeOverlayPass(trimmedName, overlays, outName, onSegProgress);
+          await deleteFile(trimmedName);
+          for (const o of overlays) {
+            if (o.name !== watermarkOverlayName) await deleteFile(o.name);
           }
         }
 
         cumulativeDuration += seg.durationSec;
         segmentOutputs.push(outName);
         setExportProgress(segEndProgress);
-        console.log(`Segment ${segIdx + 1}/${segments.length} done.`);
       }
+
+      if (watermarkOverlayName) await deleteFile(watermarkOverlayName);
 
       setExportProgress(65);
       console.log("Concatenating segments...");
@@ -1326,9 +1310,10 @@ function VidoCutApp() {
       for (const name of segmentOutputs) {
         await deleteFile(name);
       }
+      const videoForMux = 'video_concat.mp4';
 
       setExportProgress(70);
-      console.log("Segment rendering complete. Preparing audio tracks...");
+      console.log("Video ready. Preparing audio tracks...");
 
       // Audio: each non-muted clip's own soundtrack, trimmed to [trimStart,trimEnd]
       // and placed at its clip's global start; plus every voiceover track, offset
@@ -1389,7 +1374,7 @@ function VidoCutApp() {
       setExportProgress(72);
       console.log(`Encoding with ${audioInputs.length} audio track(s)...`);
 
-      const cmd = buildFfmpegCommand('video_concat.mp4', totalDuration, audioInputs);
+      const cmd = buildFfmpegCommand(videoForMux, totalDuration, audioInputs);
       await runEncode(cmd, (ratio) => {
         const clamped = Math.max(0, Math.min(1, ratio));
         setExportProgress(72 + Math.round(clamped * 23)); // 72-95%
@@ -1404,7 +1389,8 @@ function VidoCutApp() {
       a.click();
       URL.revokeObjectURL(url);
 
-      // Clean up virtual filesystem
+      // Clean up virtual filesystem (per-segment temp files are already
+      // deleted as each segment finishes)
       await deleteFile('video_concat.mp4');
       for (const srcName of writtenClipSources) {
         await deleteFile(srcName);

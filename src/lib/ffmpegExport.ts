@@ -62,32 +62,37 @@ export async function deleteFile(name: string) {
 }
 
 /**
- * Encode a segment-local PNG sequence (frames already written via
- * writeFrame with this prefix) to a video-only MP4. Used for stretches of
- * the timeline that need something drawn on top (subtitle/watermark) and
- * so can't skip the canvas render.
- */
-export async function encodeFrameSequence(framePrefix: string, fps: number, width: number, height: number, outName: string, onProgress?: (ratio: number) => void) {
-  await runEncode([
-    '-framerate', String(fps),
-    '-i', `${framePrefix}_%06d.png`,
-    '-vf', `scale=${width}:${height}`,
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-pix_fmt', 'yuv420p',
-    outName,
-  ], onProgress);
-}
-
-/**
  * Trim a stretch directly out of an already-written source video file, no
  * canvas/per-frame rendering involved. `-ss` before `-i` is an INPUT seek —
  * ffmpeg jumps to the nearest keyframe instead of decoding from the start,
  * which is what makes this fast on a long source file. It trades a little
  * frame accuracy (may start a few frames early) for speed; acceptable for
  * a skip-canvas fast path.
+ *
+ * `tryStreamCopy`: when the source is already at the target resolution
+ * (common when re-exporting a prior VidoCut export, or any clip that
+ * already matches the canvas size), skip re-encoding entirely — pure
+ * `-c copy` just remuxes, which is seconds of work instead of minutes of
+ * single-threaded WASM libx264 encoding for a long segment. Falls back to
+ * the scale+re-encode path on any failure (e.g. codec truly incompatible
+ * with concat, or ffmpeg rejects the copy).
  */
-export async function encodePassthroughVideoSegment(srcName: string, startSec: number, durationSec: number, fps: number, width: number, height: number, outName: string, onProgress?: (ratio: number) => void) {
+export async function encodePassthroughVideoSegment(srcName: string, startSec: number, durationSec: number, fps: number, width: number, height: number, outName: string, tryStreamCopy: boolean, onProgress?: (ratio: number) => void) {
+  if (tryStreamCopy) {
+    try {
+      await runEncode([
+        '-ss', Math.max(0, startSec).toFixed(3),
+        '-i', srcName,
+        '-t', durationSec.toFixed(3),
+        '-an',
+        '-c:v', 'copy',
+        outName,
+      ], onProgress);
+      return;
+    } catch {
+      // fall through to re-encode below
+    }
+  }
   await runEncode([
     '-ss', Math.max(0, startSec).toFixed(3),
     '-i', srcName,
@@ -123,6 +128,51 @@ export async function concatSegments(segmentNames: string[], outName: string) {
   await ffmpeg.writeFile('concat_list.txt', new TextEncoder().encode(listContent));
   await runEncode(['-f', 'concat', '-safe', '0', '-i', 'concat_list.txt', '-c', 'copy', outName]);
   await deleteFile('concat_list.txt');
+}
+
+export interface OverlayInput {
+  /** vFS file name of a transparent PNG (already written), same dimensions as the video. */
+  name: string;
+  /** ffmpeg `between(t,start,end)` expression, or null to overlay for the whole video (e.g. a watermark). */
+  enableExpr: string | null;
+}
+
+/**
+ * Burn subtitle/watermark images into the video via ffmpeg's `overlay`
+ * filter instead of per-frame canvas drawing. Each subtitle's text doesn't
+ * change while it's on screen, so it only needs rendering ONCE (as a
+ * transparent PNG) — ffmpeg then composites it for exactly its time window
+ * during the normal encode pass, no separate frame-by-frame render loop.
+ * `enable='between(t,a,b)'` gates a subtitle to its window; a null
+ * enableExpr (the watermark) is composited for the whole clip.
+ */
+export async function encodeOverlayPass(videoInputName: string, overlays: OverlayInput[], outName: string, onProgress?: (ratio: number) => void) {
+  const args: string[] = ['-i', videoInputName];
+  for (const o of overlays) {
+    args.push('-i', o.name);
+  }
+
+  let cur = '0:v';
+  const filterParts: string[] = [];
+  overlays.forEach((o, i) => {
+    const inputIdx = i + 1;
+    const label = i === overlays.length - 1 ? 'vout' : `ov${i}`;
+    // Commas inside the enable expression must be escaped — filter_complex
+    // uses commas to separate a single filter's own options.
+    const enable = o.enableExpr ? `:enable='${o.enableExpr.replace(/,/g, '\\,')}'` : '';
+    filterParts.push(`[${cur}][${inputIdx}:v]overlay=0:0${enable}[${label}]`);
+    cur = label;
+  });
+
+  args.push(
+    '-filter_complex', filterParts.join(';'),
+    '-map', '[vout]',
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-pix_fmt', 'yuv420p',
+    outName,
+  );
+  await runEncode(args, onProgress);
 }
 
 /**
