@@ -62,39 +62,95 @@ export async function deleteFile(name: string) {
 }
 
 /**
- * Build the ffmpeg arg array for the image-sequence-to-MP4 encode.
- *   - No audio inputs: video only.
+ * Encode a segment-local PNG sequence (frames already written via
+ * writeFrame with this prefix) to a video-only MP4. Used for stretches of
+ * the timeline that need something drawn on top (subtitle/watermark) and
+ * so can't skip the canvas render.
+ */
+export async function encodeFrameSequence(framePrefix: string, fps: number, width: number, height: number, outName: string) {
+  await runEncode([
+    '-framerate', String(fps),
+    '-i', `${framePrefix}_%06d.png`,
+    '-vf', `scale=${width}:${height}`,
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-pix_fmt', 'yuv420p',
+    outName,
+  ]);
+}
+
+/**
+ * Trim a stretch directly out of an already-written source video file, no
+ * canvas/per-frame rendering involved. `-ss` before `-i` is an INPUT seek —
+ * ffmpeg jumps to the nearest keyframe instead of decoding from the start,
+ * which is what makes this fast on a long source file. It trades a little
+ * frame accuracy (may start a few frames early) for speed; acceptable for
+ * a skip-canvas fast path.
+ */
+export async function encodePassthroughVideoSegment(srcName: string, startSec: number, durationSec: number, fps: number, width: number, height: number, outName: string) {
+  await runEncode([
+    '-ss', Math.max(0, startSec).toFixed(3),
+    '-i', srcName,
+    '-t', durationSec.toFixed(3),
+    '-vf', `scale=${width}:${height}`,
+    '-r', String(fps),
+    '-an',
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-pix_fmt', 'yuv420p',
+    outName,
+  ]);
+}
+
+/** Same as above but for a static image clip held for durationSec. */
+export async function encodePassthroughImageSegment(srcName: string, durationSec: number, fps: number, width: number, height: number, outName: string) {
+  await runEncode([
+    '-loop', '1',
+    '-i', srcName,
+    '-t', durationSec.toFixed(3),
+    '-vf', `scale=${width}:${height}`,
+    '-r', String(fps),
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-pix_fmt', 'yuv420p',
+    outName,
+  ]);
+}
+
+/** Concatenate segment MP4s (all same codec/res/fps) into one video-only file, stream-copy (fast, no re-encode). */
+export async function concatSegments(segmentNames: string[], outName: string) {
+  const listContent = segmentNames.map(n => `file '${n}'`).join('\n');
+  await ffmpeg.writeFile('concat_list.txt', new TextEncoder().encode(listContent));
+  await runEncode(['-f', 'concat', '-safe', '0', '-i', 'concat_list.txt', '-c', 'copy', outName]);
+  await deleteFile('concat_list.txt');
+}
+
+/**
+ * Final pass: mux the (already-encoded) concatenated video against the
+ * audio filter graph. `-c:v copy` — the video is already correctly encoded
+ * from the segment stage, this is just a remux + audio encode.
+ *   - No audio inputs: straight stream-copy remux.
  *   - One or more audio inputs: each gets its own adelay/atrim/volume filter
- *     branch; multiple branches are combined via amix=normalize=0 so tracks
+ *     branch; multiple branches combine via amix=normalize=0 so tracks
  *     don't get quietly attenuated by 1/N.
  * `-t durationSec` caps the output at the composition length even if an
  * audio track runs long or short.
  */
-export function buildFfmpegCommand(fps: number, durationSec: number, audioInputs: AudioInput[]): string[] {
-  const args: string[] = ['-framerate', String(fps), '-i', 'frame_%06d.png'];
+export function buildFfmpegCommand(videoInputName: string, durationSec: number, audioInputs: AudioInput[]): string[] {
+  const args: string[] = ['-i', videoInputName];
   for (const a of audioInputs) {
     args.push('-i', a.inputName);
   }
 
   if (audioInputs.length === 0) {
-    args.push(
-      '-c:v', 'libx264',
-      // ffmpeg.wasm is single-threaded; 'medium' makes long exports look
-      // frozen. 'ultrafast' trades file size for encode speed, which is the
-      // point of moving off real-time capture.
-      '-preset', 'ultrafast',
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      '-t', String(durationSec),
-      'output.mp4',
-    );
+    args.push('-c:v', 'copy', '-movflags', '+faststart', '-t', String(durationSec), 'output.mp4');
     return args;
   }
 
   const branches: string[] = [];
   const branchLabels: string[] = [];
   audioInputs.forEach((a, i) => {
-    const ffmpegInputIdx = i + 1; // input 0 is the PNG sequence
+    const ffmpegInputIdx = i + 1; // input 0 is the concatenated video
     const startMs = Math.max(0, Math.round(a.startSec * 1000));
     const label = `a${i}`;
     const srcStart = Math.max(0, a.sourceStartSec);
@@ -121,9 +177,7 @@ export function buildFfmpegCommand(fps: number, durationSec: number, audioInputs
     '-filter_complex', branches.join(';'),
     '-map', '0:v',
     '-map', finalAudioLabel,
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-pix_fmt', 'yuv420p',
+    '-c:v', 'copy',
     '-movflags', '+faststart',
     '-c:a', 'aac',
     '-b:a', '192k',

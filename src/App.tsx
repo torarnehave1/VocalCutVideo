@@ -13,7 +13,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Login } from './components/Login';
 import { readStoredUser, type AuthUser } from './lib/auth';
-import { loadFFmpeg, writeFrame, writeAudioInput, deleteFile, buildFfmpegCommand, runEncode, readOutput, type AudioInput } from './lib/ffmpegExport';
+import { loadFFmpeg, writeFrame, writeAudioInput, deleteFile, buildFfmpegCommand, runEncode, readOutput, encodeFrameSequence, encodePassthroughVideoSegment, encodePassthroughImageSegment, concatSegments, type AudioInput } from './lib/ffmpegExport';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -1203,38 +1203,109 @@ function VidoCutApp() {
         img.src = url;
       });
 
-      const totalFrames = Math.max(1, Math.ceil(totalDuration * FPS));
-      console.log(`Rendering ${totalFrames} frames at ${FPS}fps...`);
+      // Split each clip into sub-segments at subtitle boundaries. A segment
+      // with no active subtitle (and no watermark, which applies globally)
+      // skips canvas entirely: the source video/image is trimmed straight
+      // through ffmpeg. Only segments that actually need something drawn on
+      // top go through the per-frame seek+draw+PNG path. For a long clip
+      // with just a few caption lines, this turns tens of thousands of
+      // browser-level video seeks into a handful of fast ffmpeg trims.
+      const watermarkActive = !!videoState.watermarkUrl;
+      type Segment = { clip: VideoClip; localStart: number; durationSec: number; needsOverlay: boolean };
+      const segments: Segment[] = [];
+      for (const clip of videoState.clips) {
+        const clipGlobalStart = getClipGlobalStart(clip.id);
+        const clipDur = clip.trimEnd - clip.trimStart;
+        if (!isFinite(clipDur) || clipDur <= 0) continue;
 
-      for (let frame = 0; frame < totalFrames; frame++) {
-        const globalTime = frame / FPS;
-        const clipInfo = getClipAtTime(globalTime);
-        if (!clipInfo) break;
-        const { clip, localTime } = clipInfo;
-
-        if (clip.type === 'video') {
-          if (loadedClipId !== clip.id) {
-            await loadClipSrc(clip.url);
-            loadedClipId = clip.id;
+        const boundaries = new Set<number>([0, clipDur]);
+        if (!watermarkActive && showSubtitles) {
+          for (const sub of videoState.subtitles) {
+            const relStart = sub.start - clipGlobalStart;
+            const relEnd = sub.end - clipGlobalStart;
+            if (relEnd <= 0 || relStart >= clipDur) continue;
+            boundaries.add(Math.max(0, relStart));
+            boundaries.add(Math.min(clipDur, relEnd));
           }
-          await seekTo(localTime);
-          ctx.drawImage(frameVideo, 0, 0, canvas.width, canvas.height);
+        }
+        const sorted = Array.from(boundaries).sort((a, b) => a - b);
+        for (let i = 0; i < sorted.length - 1; i++) {
+          const segStart = sorted[i];
+          const segEnd = sorted[i + 1];
+          const segDur = segEnd - segStart;
+          if (segDur < 0.02) continue; // skip degenerate slivers from boundary rounding
+          const midGlobal = clipGlobalStart + (segStart + segEnd) / 2;
+          const needsOverlay = watermarkActive || (showSubtitles && videoState.subtitles.some(s => midGlobal >= s.start && midGlobal <= s.end));
+          segments.push({ clip, localStart: segStart, durationSec: segDur, needsOverlay });
+        }
+      }
+      console.log(`Timeline split into ${segments.length} segment(s): ${segments.filter(s => !s.needsOverlay).length} passthrough, ${segments.filter(s => s.needsOverlay).length} rendered.`);
+
+      const writtenClipSources = new Set<string>();
+      const segmentOutputs: string[] = [];
+
+      for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+        const seg = segments[segIdx];
+        const outName = `seg_${String(segIdx).padStart(4, '0')}.mp4`;
+        const sourceStart = seg.clip.trimStart + seg.localStart;
+
+        if (!seg.needsOverlay) {
+          // Skip canvas: hand the original file straight to ffmpeg.
+          const srcName = `clip_src_${seg.clip.id}`;
+          if (!writtenClipSources.has(srcName)) {
+            await writeAudioInput(srcName, seg.clip.file || seg.clip.url);
+            writtenClipSources.add(srcName);
+          }
+          if (seg.clip.type === 'video') {
+            await encodePassthroughVideoSegment(srcName, sourceStart, seg.durationSec, FPS, canvas.width, canvas.height, outName);
+          } else {
+            await encodePassthroughImageSegment(srcName, seg.durationSec, FPS, canvas.width, canvas.height, outName);
+          }
         } else {
-          const img = await loadImage(clip.url);
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          loadedClipId = null;
+          // Needs subtitle/watermark burned in: render every frame via canvas.
+          const frameCount = Math.max(1, Math.round(seg.durationSec * FPS));
+          const framePrefix = `s${segIdx}`;
+          for (let f = 0; f < frameCount; f++) {
+            const localTime = sourceStart + f / FPS;
+            const globalTime = getClipGlobalStart(seg.clip.id) + seg.localStart + f / FPS;
+
+            if (seg.clip.type === 'video') {
+              if (loadedClipId !== seg.clip.id) {
+                await loadClipSrc(seg.clip.url);
+                loadedClipId = seg.clip.id;
+              }
+              await seekTo(localTime);
+              ctx.drawImage(frameVideo, 0, 0, canvas.width, canvas.height);
+            } else {
+              const img = await loadImage(seg.clip.url);
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              loadedClipId = null;
+            }
+
+            drawSubtitlesAndWatermark(globalTime);
+
+            const blob = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
+            await writeFrame(`${framePrefix}_${String(f).padStart(6, '0')}.png`, blob);
+          }
+          await encodeFrameSequence(framePrefix, FPS, canvas.width, canvas.height, outName);
+          for (let f = 0; f < frameCount; f++) {
+            await deleteFile(`${framePrefix}_${String(f).padStart(6, '0')}.png`);
+          }
         }
 
-        drawSubtitlesAndWatermark(globalTime);
+        segmentOutputs.push(outName);
+        setExportProgress(5 + Math.round(((segIdx + 1) / segments.length) * 60)); // 5-65%
+      }
 
-        const blob = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
-        await writeFrame(`frame_${String(frame).padStart(6, '0')}.png`, blob);
-
-        setExportProgress(5 + Math.round((frame / totalFrames) * 65)); // 5-70%
+      setExportProgress(65);
+      console.log("Concatenating segments...");
+      await concatSegments(segmentOutputs, 'video_concat.mp4');
+      for (const name of segmentOutputs) {
+        await deleteFile(name);
       }
 
       setExportProgress(70);
-      console.log("Frame rendering complete. Preparing audio tracks...");
+      console.log("Segment rendering complete. Preparing audio tracks...");
 
       // Audio: each non-muted clip's own soundtrack, trimmed to [trimStart,trimEnd]
       // and placed at its clip's global start; plus every voiceover track, offset
@@ -1295,7 +1366,7 @@ function VidoCutApp() {
       setExportProgress(72);
       console.log(`Encoding with ${audioInputs.length} audio track(s)...`);
 
-      const cmd = buildFfmpegCommand(FPS, totalDuration, audioInputs);
+      const cmd = buildFfmpegCommand('video_concat.mp4', totalDuration, audioInputs);
       await runEncode(cmd, (ratio) => {
         const clamped = Math.max(0, Math.min(1, ratio));
         setExportProgress(72 + Math.round(clamped * 23)); // 72-95%
@@ -1311,8 +1382,9 @@ function VidoCutApp() {
       URL.revokeObjectURL(url);
 
       // Clean up virtual filesystem
-      for (let frame = 0; frame < totalFrames; frame++) {
-        await deleteFile(`frame_${String(frame).padStart(6, '0')}.png`);
+      await deleteFile('video_concat.mp4');
+      for (const srcName of writtenClipSources) {
+        await deleteFile(srcName);
       }
       for (const input of audioInputs) {
         await deleteFile(input.inputName);
