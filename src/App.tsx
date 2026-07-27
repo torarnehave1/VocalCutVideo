@@ -1193,14 +1193,20 @@ function VidoCutApp() {
         await writeFrame(watermarkOverlayName, blob);
       }
 
-      // Split each clip into sub-segments at subtitle boundaries. A segment
-      // with no active subtitle (and no watermark, which applies globally)
-      // stays a pure trim — stream-copied when the source already matches
+      // Split each clip into sub-segments at subtitle AND watermark boundaries.
+      // Like subtitles, the watermark now has its own [start,end] window
+      // (default: the whole video, for backward compatibility with existing
+      // projects) instead of being unconditionally global — so a logo that
+      // only covers the first/last few seconds no longer forces a full
+      // re-encode of the entire timeline. A segment with nothing active in
+      // it stays a pure trim — stream-copied when the source already matches
       // export resolution, so it costs seconds, not minutes. Only segments
       // that actually need something drawn on top pay for a re-encode, and
-      // that re-encode is scoped to JUST that segment's own (usually short)
-      // duration via ffmpeg's overlay filter — not the whole timeline.
+      // that re-encode is scoped to JUST that segment's own duration via
+      // ffmpeg's overlay filter — not the whole timeline.
       const watermarkActive = !!videoState.watermarkUrl;
+      const watermarkStart = videoState.watermarkStart ?? 0;
+      const watermarkEnd = videoState.watermarkEnd ?? totalDuration;
       type Segment = { clip: VideoClip; localStart: number; durationSec: number; needsOverlay: boolean };
       const segments: Segment[] = [];
       for (const clip of videoState.clips) {
@@ -1209,11 +1215,19 @@ function VidoCutApp() {
         if (!isFinite(clipDur) || clipDur <= 0) continue;
 
         const boundaries = new Set<number>([0, clipDur]);
-        if (!watermarkActive && showSubtitles) {
+        if (showSubtitles) {
           for (const sub of videoState.subtitles) {
             const relStart = sub.start - clipGlobalStart;
             const relEnd = sub.end - clipGlobalStart;
             if (relEnd <= 0 || relStart >= clipDur) continue;
+            boundaries.add(Math.max(0, relStart));
+            boundaries.add(Math.min(clipDur, relEnd));
+          }
+        }
+        if (watermarkActive) {
+          const relStart = watermarkStart - clipGlobalStart;
+          const relEnd = watermarkEnd - clipGlobalStart;
+          if (!(relEnd <= 0 || relStart >= clipDur)) {
             boundaries.add(Math.max(0, relStart));
             boundaries.add(Math.min(clipDur, relEnd));
           }
@@ -1225,7 +1239,8 @@ function VidoCutApp() {
           const segDur = segEnd - segStart;
           if (segDur < 0.02) continue;
           const midGlobal = clipGlobalStart + (segStart + segEnd) / 2;
-          const needsOverlay = watermarkActive || (showSubtitles && videoState.subtitles.some(s => midGlobal >= s.start && midGlobal <= s.end));
+          const watermarkHere = watermarkActive && midGlobal >= watermarkStart && midGlobal <= watermarkEnd;
+          const needsOverlay = watermarkHere || (showSubtitles && videoState.subtitles.some(s => midGlobal >= s.start && midGlobal <= s.end));
           segments.push({ clip, localStart: segStart, durationSec: segDur, needsOverlay });
         }
       }
@@ -1286,7 +1301,22 @@ function VidoCutApp() {
             }
           }
           if (watermarkOverlayName) {
-            overlays.push({ name: watermarkOverlayName, enableExpr: null });
+            const segGlobalStart = clipGlobalStart + seg.localStart;
+            const localWmStart = watermarkStart - segGlobalStart;
+            const localWmEnd = watermarkEnd - segGlobalStart;
+            if (localWmEnd > 0 && localWmStart < seg.durationSec) {
+              // Gate with enable= too: this segment may be a superset of the
+              // watermark's own window (e.g. it also contains a subtitle
+              // that starts earlier), so the watermark shouldn't necessarily
+              // cover the segment's full duration.
+              const gatedStart = Math.max(0, localWmStart);
+              const gatedEnd = Math.min(seg.durationSec, localWmEnd);
+              const fullyCovers = gatedStart <= 0.001 && gatedEnd >= seg.durationSec - 0.001;
+              overlays.push({
+                name: watermarkOverlayName,
+                enableExpr: fullyCovers ? null : `between(t,${gatedStart.toFixed(3)},${gatedEnd.toFixed(3)})`,
+              });
+            }
           }
 
           outName = `overlay_${segIdx}.mp4`;
@@ -2053,7 +2083,10 @@ function VidoCutApp() {
               </AnimatePresence>
 
               {/* Watermark Overlay */}
-              {videoState.watermarkUrl && (() => {
+              {videoState.watermarkUrl
+                && currentTime >= (videoState.watermarkStart ?? 0)
+                && currentTime <= (videoState.watermarkEnd ?? totalDuration)
+                && (() => {
                 const pos = videoState.watermarkPosition || 'top-right';
                 let posClass = "top-4 right-4";
                 if (pos === 'top-left') posClass = "top-4 left-4";
@@ -3574,6 +3607,41 @@ function VidoCutApp() {
                             className="hidden"
                           />
                         </label>
+
+                        {/* Visible Time Range */}
+                        <div className="space-y-2 pt-2 border-t border-white/10">
+                          <div className="flex justify-between items-center">
+                            <span className="text-xs font-bold text-slate-300">Visible Time Range</span>
+                            <span className="text-[10px] text-slate-500">Full length by default</span>
+                          </div>
+                          <p className="text-[10px] text-slate-500 leading-relaxed">
+                            Limiting this to just the start or end (instead of the whole video) makes export much faster — only the covered stretch needs re-encoding.
+                          </p>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div className="space-y-1">
+                              <label className="text-[10px] font-medium text-slate-400">Start Time (s)</label>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0"
+                                value={(videoState.watermarkStart ?? 0).toFixed(1)}
+                                onChange={(e) => setVideoState(prev => ({ ...prev, watermarkStart: Math.max(0, parseFloat(e.target.value) || 0) }))}
+                                className="w-full bg-white/5 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[10px] font-medium text-slate-400">End Time (s)</label>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0"
+                                value={(videoState.watermarkEnd ?? totalDuration).toFixed(1)}
+                                onChange={(e) => setVideoState(prev => ({ ...prev, watermarkEnd: Math.max(0.1, parseFloat(e.target.value) || 0) }))}
+                                className="w-full bg-white/5 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono"
+                              />
+                            </div>
+                          </div>
+                        </div>
 
                         {/* Screen Position Selector Grid */}
                         <div className="space-y-2 pt-2 border-t border-white/10">

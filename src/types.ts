@@ -45,4 +45,6 @@ export interface VideoState {
   watermarkSize?: number; // percentage of width (0-100)
   watermarkPosition?: WatermarkPosition; // default 'top-right'
   watermarkOpacity?: number; // percentage (0-100), default 80
+  watermarkStart?: number; // seconds; undefined = 0 (start of video)
+  watermarkEnd?: number; // seconds; undefined = full video duration
 }
