@@ -1243,11 +1243,25 @@ function VidoCutApp() {
 
       const writtenClipSources = new Set<string>();
       const segmentOutputs: string[] = [];
+      // Progress is weighted by segment DURATION, not segment count — a
+      // timeline with one 28-minute segment and two 5-second ones should not
+      // treat them as equal-sized steps, or the bar sits still for nearly
+      // the whole export while that one long segment encodes.
+      const totalSegDuration = segments.reduce((acc, s) => acc + s.durationSec, 0) || 1;
+      let cumulativeDuration = 0;
 
       for (let segIdx = 0; segIdx < segments.length; segIdx++) {
         const seg = segments[segIdx];
         const outName = `seg_${String(segIdx).padStart(4, '0')}.mp4`;
         const sourceStart = seg.clip.trimStart + seg.localStart;
+        const segStartProgress = 5 + Math.round((cumulativeDuration / totalSegDuration) * 60);
+        const segEndProgress = 5 + Math.round(((cumulativeDuration + seg.durationSec) / totalSegDuration) * 60);
+        console.log(`Segment ${segIdx + 1}/${segments.length}: ${seg.needsOverlay ? 'render' : 'passthrough'}, ${seg.durationSec.toFixed(1)}s`);
+
+        const onSegEncodeProgress = (ratio: number) => {
+          const clamped = Math.max(0, Math.min(1, ratio));
+          setExportProgress(segStartProgress + Math.round((segEndProgress - segStartProgress) * clamped));
+        };
 
         if (!seg.needsOverlay) {
           // Skip canvas: hand the original file straight to ffmpeg.
@@ -1257,12 +1271,14 @@ function VidoCutApp() {
             writtenClipSources.add(srcName);
           }
           if (seg.clip.type === 'video') {
-            await encodePassthroughVideoSegment(srcName, sourceStart, seg.durationSec, FPS, canvas.width, canvas.height, outName);
+            await encodePassthroughVideoSegment(srcName, sourceStart, seg.durationSec, FPS, canvas.width, canvas.height, outName, onSegEncodeProgress);
           } else {
-            await encodePassthroughImageSegment(srcName, seg.durationSec, FPS, canvas.width, canvas.height, outName);
+            await encodePassthroughImageSegment(srcName, seg.durationSec, FPS, canvas.width, canvas.height, outName, onSegEncodeProgress);
           }
         } else {
           // Needs subtitle/watermark burned in: render every frame via canvas.
+          // Rendering gets 70% of this segment's progress band, encoding the
+          // PNG sequence gets the remaining 30%.
           const frameCount = Math.max(1, Math.round(seg.durationSec * FPS));
           const framePrefix = `s${segIdx}`;
           for (let f = 0; f < frameCount; f++) {
@@ -1286,15 +1302,22 @@ function VidoCutApp() {
 
             const blob = await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
             await writeFrame(`${framePrefix}_${String(f).padStart(6, '0')}.png`, blob);
+
+            setExportProgress(segStartProgress + Math.round((segEndProgress - segStartProgress) * 0.7 * (f / frameCount)));
           }
-          await encodeFrameSequence(framePrefix, FPS, canvas.width, canvas.height, outName);
+          await encodeFrameSequence(framePrefix, FPS, canvas.width, canvas.height, outName, (ratio) => {
+            const clamped = Math.max(0, Math.min(1, ratio));
+            setExportProgress(segStartProgress + Math.round((segEndProgress - segStartProgress) * (0.7 + 0.3 * clamped)));
+          });
           for (let f = 0; f < frameCount; f++) {
             await deleteFile(`${framePrefix}_${String(f).padStart(6, '0')}.png`);
           }
         }
 
+        cumulativeDuration += seg.durationSec;
         segmentOutputs.push(outName);
-        setExportProgress(5 + Math.round(((segIdx + 1) / segments.length) * 60)); // 5-65%
+        setExportProgress(segEndProgress);
+        console.log(`Segment ${segIdx + 1}/${segments.length} done.`);
       }
 
       setExportProgress(65);

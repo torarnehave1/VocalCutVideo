@@ -67,7 +67,7 @@ export async function deleteFile(name: string) {
  * the timeline that need something drawn on top (subtitle/watermark) and
  * so can't skip the canvas render.
  */
-export async function encodeFrameSequence(framePrefix: string, fps: number, width: number, height: number, outName: string) {
+export async function encodeFrameSequence(framePrefix: string, fps: number, width: number, height: number, outName: string, onProgress?: (ratio: number) => void) {
   await runEncode([
     '-framerate', String(fps),
     '-i', `${framePrefix}_%06d.png`,
@@ -76,7 +76,7 @@ export async function encodeFrameSequence(framePrefix: string, fps: number, widt
     '-preset', 'ultrafast',
     '-pix_fmt', 'yuv420p',
     outName,
-  ]);
+  ], onProgress);
 }
 
 /**
@@ -87,7 +87,7 @@ export async function encodeFrameSequence(framePrefix: string, fps: number, widt
  * frame accuracy (may start a few frames early) for speed; acceptable for
  * a skip-canvas fast path.
  */
-export async function encodePassthroughVideoSegment(srcName: string, startSec: number, durationSec: number, fps: number, width: number, height: number, outName: string) {
+export async function encodePassthroughVideoSegment(srcName: string, startSec: number, durationSec: number, fps: number, width: number, height: number, outName: string, onProgress?: (ratio: number) => void) {
   await runEncode([
     '-ss', Math.max(0, startSec).toFixed(3),
     '-i', srcName,
@@ -99,11 +99,11 @@ export async function encodePassthroughVideoSegment(srcName: string, startSec: n
     '-preset', 'ultrafast',
     '-pix_fmt', 'yuv420p',
     outName,
-  ]);
+  ], onProgress);
 }
 
 /** Same as above but for a static image clip held for durationSec. */
-export async function encodePassthroughImageSegment(srcName: string, durationSec: number, fps: number, width: number, height: number, outName: string) {
+export async function encodePassthroughImageSegment(srcName: string, durationSec: number, fps: number, width: number, height: number, outName: string, onProgress?: (ratio: number) => void) {
   await runEncode([
     '-loop', '1',
     '-i', srcName,
@@ -114,7 +114,7 @@ export async function encodePassthroughImageSegment(srcName: string, durationSec
     '-preset', 'ultrafast',
     '-pix_fmt', 'yuv420p',
     outName,
-  ]);
+  ], onProgress);
 }
 
 /** Concatenate segment MP4s (all same codec/res/fps) into one video-only file, stream-copy (fast, no re-encode). */
