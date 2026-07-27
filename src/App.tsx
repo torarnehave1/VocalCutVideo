@@ -381,7 +381,17 @@ function VidoCutApp() {
         const tempUrl = URL.createObjectURL(file);
         tempEl.src = tempUrl;
         tempEl.onloadedmetadata = () => {
-          resolve(tempEl.duration && isFinite(tempEl.duration) ? tempEl.duration : 5);
+          if (isFinite(tempEl.duration)) {
+            resolve(tempEl.duration);
+            return;
+          }
+          // Some MP4/MOV files (phone recordings, screen captures) report
+          // duration as Infinity until the browser seeks near the end.
+          tempEl.currentTime = 1e101;
+          tempEl.ontimeupdate = () => {
+            tempEl.ontimeupdate = null;
+            resolve(isFinite(tempEl.duration) ? tempEl.duration : 5);
+          };
         };
         tempEl.onerror = () => {
           resolve(5);
