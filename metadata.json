@@ -1,5 +1,5 @@
 {
-  "name": "VocalCut: AI Video Editor",
+  "name": "VidoCut",
   "description": "A basic video editor to trim clips, add AI or recorded voiceovers, and manage subtitles.",
   "requestFramePermissions": [
     "microphone"

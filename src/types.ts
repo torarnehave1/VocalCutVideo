@@ -3,6 +3,14 @@ export interface Subtitle {
   text: string;
   start: number;
   end: number;
+  fontSize?: number; // e.g. 24
+  color?: string; // e.g. '#ffffff'
+  backgroundColor?: string; // e.g. 'rgba(0,0,0,0.75)'
+  positionY?: 'top' | 'center' | 'bottom';
+  positionX?: 'left' | 'center' | 'right';
+  fontWeight?: 'normal' | 'bold' | 'extrabold';
+  fontStyle?: 'normal' | 'italic';
+  hasShadow?: boolean;
 }
 
 export interface Voiceover {
@@ -11,8 +19,9 @@ export interface Voiceover {
   file?: File | Blob;
   clipId?: string; // Optional for backward compatibility, but preferred
   relativeStartTime: number; // Time relative to the clip's start (trimStart)
-  type: 'recorded' | 'ai';
+  type: 'recorded' | 'ai' | 'extracted';
   text?: string;
+  duration?: number;
 }
 
 export interface VideoClip {
@@ -23,7 +32,10 @@ export interface VideoClip {
   trimStart: number;
   trimEnd: number;
   type: 'video' | 'image';
+  muted?: boolean;
 }
+
+export type WatermarkPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'center' | 'top-center' | 'bottom-center';
 
 export interface VideoState {
   clips: VideoClip[];
@@ -31,4 +43,6 @@ export interface VideoState {
   voiceovers: Voiceover[];
   watermarkUrl?: string;
   watermarkSize?: number; // percentage of width (0-100)
+  watermarkPosition?: WatermarkPosition; // default 'top-right'
+  watermarkOpacity?: number; // percentage (0-100), default 80
 }
